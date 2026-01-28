@@ -1,16 +1,24 @@
 # main.py
 # ------------------------------------------------------------
-# CUSTOMS BOT: Google Drive -> Webhook -> Changes API -> Telegram Topic
+# CUSTOMS BOT (Production-ish)
+# Google Drive -> Webhook -> Changes API -> Telegram Topic
 #
 # ✅ Add bot to Telegram group (make admin)
-# ✅ In a Topic, type: /register autumn   or /register Autumn   or /register miss lexa
-#    - Bot will AUTO-CREATE folder: Custom Orders/Completed/<name> (case-insensitive)
-#    - If folder already exists (any case), it will NOT create duplicate
-#    - It binds notifications to THAT topic thread only
+# ✅ In a Topic, type:
+#    /register autumn
+#    /register Autumn
+#    /register miss lexa
+#
+# Behavior:
+# - Case-insensitive, multi-word supported
+# - Auto-creates Drive folder under: /Custom Orders/Completed/<client name> (if missing)
+# - If folder exists (any case), reuses it (no duplicates)
+# - Binds notifications to THAT GROUP + THAT TOPIC thread only
+# - ✅ Persist bindings in Railway Postgres (so redeploys won't erase registrations)
 #
 # IMPORTANT:
 # 1) Service account MUST have Editor access to the Completed folder to create subfolders.
-# 2) Drive watches expire—use /watch/renew endpoint (or uptime ping) to keep it alive.
+# 2) Drive watches expire—call /watch/renew daily (cron/uptime ping).
 # ------------------------------------------------------------
 
 import os
@@ -20,6 +28,7 @@ import uuid
 from typing import Optional, Dict, Any, List, Tuple
 
 import httpx
+import psycopg2
 from fastapi import FastAPI, Request, Response, HTTPException
 
 from google.oauth2 import service_account
@@ -37,6 +46,8 @@ GOOGLE_SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
 COMPLETED_FOLDER_ID = os.getenv("COMPLETED_FOLDER_ID")  # folder ID of /Custom Orders/Completed
 WATCH_SECRET = os.getenv("WATCH_SECRET", "change-me-drive-secret")
 
+DATABASE_URL = os.getenv("DATABASE_URL")  # Railway Postgres
+
 if not TELEGRAM_BOT_TOKEN:
     raise RuntimeError("Missing env var: TELEGRAM_BOT_TOKEN")
 if not BASE_URL:
@@ -45,6 +56,63 @@ if not GOOGLE_SERVICE_ACCOUNT_JSON:
     raise RuntimeError("Missing env var: GOOGLE_SERVICE_ACCOUNT_JSON")
 if not COMPLETED_FOLDER_ID:
     raise RuntimeError("Missing env var: COMPLETED_FOLDER_ID")
+if not DATABASE_URL:
+    raise RuntimeError("Missing env var: DATABASE_URL (add Railway Postgres)")
+
+# ---------------- DB (POSTGRES) ----------------
+db = psycopg2.connect(DATABASE_URL, sslmode="require")
+db.autocommit = True
+
+def init_db() -> None:
+    with db.cursor() as cur:
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS bindings (
+            client_key TEXT PRIMARY KEY,
+            folder_id TEXT NOT NULL,
+            folder_name TEXT NOT NULL,
+            chat_id BIGINT NOT NULL,
+            thread_id BIGINT NOT NULL,
+            created_at TIMESTAMPTZ DEFAULT NOW(),
+            updated_at TIMESTAMPTZ DEFAULT NOW()
+        );
+        """)
+
+def save_binding(client_key: str, folder_id: str, folder_name: str, chat_id: int, thread_id: int) -> None:
+    with db.cursor() as cur:
+        cur.execute("""
+        INSERT INTO bindings (client_key, folder_id, folder_name, chat_id, thread_id, updated_at)
+        VALUES (%s, %s, %s, %s, %s, NOW())
+        ON CONFLICT (client_key) DO UPDATE SET
+            folder_id = EXCLUDED.folder_id,
+            folder_name = EXCLUDED.folder_name,
+            chat_id = EXCLUDED.chat_id,
+            thread_id = EXCLUDED.thread_id,
+            updated_at = NOW();
+        """, (client_key, folder_id, folder_name, chat_id, thread_id))
+
+def delete_binding(client_key: str) -> bool:
+    with db.cursor() as cur:
+        cur.execute("DELETE FROM bindings WHERE client_key = %s;", (client_key,))
+        return cur.rowcount > 0
+
+def load_bindings_into_state(state: Dict[str, Any]) -> None:
+    state["client_map"] = {}
+    state["folder_index"] = {}
+    with db.cursor() as cur:
+        cur.execute("SELECT client_key, folder_id, folder_name, chat_id, thread_id FROM bindings;")
+        rows = cur.fetchall()
+
+    for client_key, folder_id, folder_name, chat_id, thread_id in rows:
+        # folder index for /register case-insensitive matching
+        state["folder_index"][client_key] = {"id": folder_id, "name": folder_name}
+        # client map for routing Drive notifications
+        state["client_map"][folder_id] = {
+            "chat_id": int(chat_id),
+            "thread_id": int(thread_id),
+            "team_name": folder_name,
+            "client_key": client_key,
+        }
+    state["folder_index_loaded"] = True
 
 # ---------------- GOOGLE DRIVE CLIENT ----------------
 # Needed for AUTO-CREATE folder:
@@ -55,22 +123,19 @@ creds_info = json.loads(GOOGLE_SERVICE_ACCOUNT_JSON)
 creds = service_account.Credentials.from_service_account_info(creds_info, scopes=SCOPES)
 drive = build("drive", "v3", credentials=creds, cache_discovery=False)
 
-# ---------------- STATE (in-memory; add Postgres later for persistence) ----------------
+# ---------------- STATE ----------------
 STATE: Dict[str, Any] = {
     "page_token": None,
     "channel_id": None,
     "resource_id": None,
     "expiration_ms": None,
 
-    # Drive client folder ID -> destination
-    # { folder_id: {"chat_id": int, "thread_id": int, "team_name": str, "client_key": str} }
+    # folder_id -> destination
     "client_map": {},
 
-    # Canonical client key -> folder info
-    # { "autumn": {"id": "...", "name": "Autumn"} }
+    # canonical client key -> {"id": folder_id, "name": folder_name}
     "folder_index": {},
 
-    # Simple cache time for folder index (optional)
     "folder_index_loaded": False,
 }
 
@@ -101,13 +166,13 @@ def canonical_name(name: str) -> str:
     return name.lower()
 
 def display_name(name: str) -> str:
-    # Keep what user typed (normalized spaces). You can swap to .title() if you want.
+    # Keeps the user's casing but normalizes spaces.
+    # If you prefer Title Case folders, use: return canonical then .title()
     name = name.strip()
     name = re.sub(r"\s+", " ", name)
     return name
 
 def list_completed_folders() -> List[Dict[str, str]]:
-    """List all direct subfolders under Completed."""
     folders: List[Dict[str, str]] = []
     page_token = None
     q = (
@@ -128,17 +193,23 @@ def list_completed_folders() -> List[Dict[str, str]]:
             break
     return folders
 
-def load_folder_index() -> None:
-    """Build canonical folder lookup table so /register is case-insensitive."""
+def refresh_folder_index_from_drive() -> None:
+    """
+    Rebuilds canonical folder index from Drive.
+    This helps if someone manually adds folders in Drive.
+    """
     idx: Dict[str, Dict[str, str]] = {}
     for f in list_completed_folders():
         key = canonical_name(f.get("name", ""))
         if not key:
             continue
-        # If duplicates somehow exist, keep the first one found.
         if key not in idx:
             idx[key] = {"id": f["id"], "name": f.get("name", "")}
-    STATE["folder_index"] = idx
+    # Merge DB index + Drive index, but prefer DB (DB represents active bindings)
+    # If DB has it, keep DB. Otherwise keep Drive.
+    for k, v in idx.items():
+        if k not in STATE["folder_index"]:
+            STATE["folder_index"][k] = v
     STATE["folder_index_loaded"] = True
 
 def create_client_folder(folder_name: str) -> Dict[str, str]:
@@ -153,31 +224,32 @@ def create_client_folder(folder_name: str) -> Dict[str, str]:
 def find_or_create_client_folder(client_input: str) -> Tuple[str, str, bool]:
     """
     Returns: (folder_id, actual_folder_name, created_bool)
-    Case-insensitive match; supports multi-word folder names.
+    Case-insensitive; supports multi-word names.
+    Uses DB-loaded folder_index first; then Drive refresh; then creates.
     """
-    if not STATE["folder_index_loaded"]:
-        load_folder_index()
-
     key = canonical_name(client_input)
     if not key:
         raise ValueError("Empty client name")
+
+    if not STATE["folder_index_loaded"]:
+        # Load DB bindings already set folder_index; but just in case:
+        refresh_folder_index_from_drive()
 
     existing = STATE["folder_index"].get(key)
     if existing:
         return existing["id"], existing["name"], False
 
-    # Create folder with nice display name
-    nice = display_name(client_input)
-
-    # Safety: re-load once before creating (helps if something changed recently)
-    load_folder_index()
+    # Refresh from Drive before creating (prevents duplicates if someone created it manually)
+    refresh_folder_index_from_drive()
     existing2 = STATE["folder_index"].get(key)
     if existing2:
         return existing2["id"], existing2["name"], False
 
+    # Create new folder
+    nice = display_name(client_input)
     created = create_client_folder(nice)
 
-    # Update index
+    # Update in-memory index (and DB will store binding when /register runs)
     STATE["folder_index"][key] = {"id": created["id"], "name": created["name"]}
     return created["id"], created["name"], True
 
@@ -215,7 +287,11 @@ def start_watch() -> Dict[str, Any]:
 # ---------------- STARTUP ----------------
 @app.on_event("startup")
 async def on_startup():
-    # Drive watch + Telegram webhook
+    init_db()
+    load_bindings_into_state(STATE)  # ✅ restores /register bindings after deploys
+    # Also merge in any folders that exist in Drive but not in DB (optional)
+    refresh_folder_index_from_drive()
+
     start_watch()
     await ensure_telegram_webhook()
 
@@ -231,12 +307,10 @@ async def telegram_webhook(secret: str, request: Request):
     if "my_chat_member" in update:
         chat = update["my_chat_member"]["chat"]
         chat_id = chat["id"]
-        title = chat.get("title", "this group")
-
         await tg_send(
             chat_id,
             "👋 Hi! I’m Customs Notify Bot.\n\n"
-            "✅ To connect this Topic to a Drive folder, go INSIDE the Topic and type:\n"
+            "✅ Go INSIDE the Topic where you want updates, then type:\n"
             "/register <client name>\n\n"
             "Examples:\n"
             "/register autumn\n"
@@ -257,8 +331,8 @@ async def telegram_webhook(secret: str, request: Request):
     chat = msg["chat"]
     chat_id = chat["id"]
     chat_type = chat.get("type")
+    thread_id = msg.get("message_thread_id")  # present if command is run inside a topic
 
-    thread_id = msg.get("message_thread_id")  # Topics: present when command is run inside a topic
     sender = msg.get("from") or {}
     user_id = sender.get("id")
 
@@ -294,6 +368,7 @@ async def telegram_webhook(secret: str, request: Request):
             return {"ok": True}
 
         client_input = parts[1].strip()
+        key = canonical_name(client_input)
 
         try:
             folder_id, folder_name, created = find_or_create_client_folder(client_input)
@@ -307,14 +382,24 @@ async def telegram_webhook(secret: str, request: Request):
             )
             return {"ok": True}
 
-        # Bind: THIS drive folder -> THIS group & THIS topic thread
-        key = canonical_name(client_input)
+        # Bind: folder -> this group/topic
         STATE["client_map"][folder_id] = {
             "chat_id": int(chat_id),
             "thread_id": int(thread_id),
             "team_name": folder_name,
             "client_key": key,
         }
+        STATE["folder_index"][key] = {"id": folder_id, "name": folder_name}
+        STATE["folder_index_loaded"] = True
+
+        # ✅ Persist in Postgres (survives redeploys)
+        save_binding(
+            client_key=key,
+            folder_id=folder_id,
+            folder_name=folder_name,
+            chat_id=int(chat_id),
+            thread_id=int(thread_id),
+        )
 
         if created:
             reply = (
@@ -333,9 +418,35 @@ async def telegram_webhook(secret: str, request: Request):
         await tg_send(chat_id, reply, thread_id=thread_id)
         return {"ok": True}
 
+    # ---------- /unregister ----------
+    if text.lower().startswith("/unregister"):
+        if chat_type not in ("group", "supergroup"):
+            await tg_send(chat_id, "Use /unregister inside a Telegram group.")
+            return {"ok": True}
+        if thread_id is None:
+            await tg_send(chat_id, "Run /unregister inside the Topic you want to unlink.")
+            return {"ok": True}
+        if not await is_admin():
+            await tg_send(chat_id, "Only admins can run /unregister.", thread_id=thread_id)
+            return {"ok": True}
+
+        parts = text.split(maxsplit=1)
+        if len(parts) < 2 or not parts[1].strip():
+            await tg_send(chat_id, "Usage: /unregister <client name>\nExample: /unregister autumn", thread_id=thread_id)
+            return {"ok": True}
+
+        key = canonical_name(parts[1].strip())
+        existed = delete_binding(key)
+
+        # Reload state from DB to be consistent
+        load_bindings_into_state(STATE)
+        refresh_folder_index_from_drive()
+
+        await tg_send(chat_id, "🗑️ Unregistered (deleted binding)." if existed else "Nothing to delete for that name.", thread_id=thread_id)
+        return {"ok": True}
+
     # ---------- /list ----------
     if text.lower().startswith("/list"):
-        # Show bindings (for debugging)
         lines = []
         for fid, dest in STATE["client_map"].items():
             lines.append(
@@ -349,8 +460,8 @@ async def telegram_webhook(secret: str, request: Request):
         if not await is_admin():
             await tg_send(chat_id, "Only admins can run /refreshfolders.", thread_id=thread_id)
             return {"ok": True}
-        load_folder_index()
-        await tg_send(chat_id, f"✅ Refreshed folder index. Found {len(STATE['folder_index'])} client folders.", thread_id=thread_id)
+        refresh_folder_index_from_drive()
+        await tg_send(chat_id, f"✅ Refreshed folder index. Known folders: {len(STATE['folder_index'])}.", thread_id=thread_id)
         return {"ok": True}
 
     return {"ok": True}
@@ -358,7 +469,6 @@ async def telegram_webhook(secret: str, request: Request):
 # ---------------- DRIVE WEBHOOK ----------------
 @app.post("/drive/webhook")
 async def drive_webhook(request: Request):
-    # basic secret
     secret = request.query_params.get("secret")
     if secret != WATCH_SECRET:
         return Response(status_code=403)
@@ -367,18 +477,14 @@ async def drive_webhook(request: Request):
     resource_id = request.headers.get("X-Goog-Resource-Id")
     resource_state = request.headers.get("X-Goog-Resource-State")
 
-    # validate watch channel
     if channel_id != STATE["channel_id"] or resource_id != STATE["resource_id"]:
         return Response(status_code=200)
 
-    # initial sync event
     if resource_state == "sync":
         return Response(status_code=200)
 
-    # pull changes since last token
     old_token = STATE["page_token"]
     if not old_token:
-        # should not happen, but self-heal
         STATE["page_token"] = get_start_page_token()
         return {"ok": True, "notified": 0}
 
@@ -400,7 +506,7 @@ async def drive_webhook(request: Request):
         parents = f.get("parents") or []
         link = f.get("webViewLink") or (f"https://drive.google.com/file/d/{file_id}/view" if file_id else "")
 
-        # Only notify if direct parent is a registered client folder
+        # Notify if direct parent folder is registered
         dest = None
         for p in parents:
             if p in STATE["client_map"]:
@@ -420,16 +526,15 @@ async def drive_webhook(request: Request):
             await tg_send(dest["chat_id"], text, thread_id=dest.get("thread_id"))
             notified += 1
         except Exception:
-            # Don’t break the whole webhook if Telegram has a temporary issue
             continue
 
     return {"ok": True, "changes": len(changes), "notified": notified}
 
-# ---------------- WATCH RENEW (Drive watches expire) ----------------
+# ---------------- WATCH RENEW ----------------
 @app.post("/watch/renew")
 def renew_watch(secret: str):
     """
-    Call this periodically (daily is fine) from an uptime/cron ping:
+    Call daily using a cron/uptime ping:
     POST /watch/renew?secret=WATCH_SECRET
     """
     if secret != WATCH_SECRET:
