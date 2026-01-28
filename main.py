@@ -16,17 +16,20 @@
 # - Binds notifications to THAT GROUP + THAT TOPIC thread only
 # - ✅ Persist bindings in Postgres (redeploy/edit won't erase)
 # - ✅ DEDUPE by file_id (one notification per file forever)
+# - ✅ AUTO-RENEW Drive watch in the background (no cron needed)
 #
 # IMPORTANT:
 # 1) Service account MUST have Editor access to the Completed folder to create subfolders.
-# 2) Drive watches expire—call /watch/renew daily (cron/uptime ping).
-# 3) BASE_URL must NOT end with a slash.
+# 2) BASE_URL must NOT end with a slash.
+# 3) Railway may run more than one instance; this code is safe (duplicate renews are okay).
 # ------------------------------------------------------------
 
 import os
 import json
 import re
 import uuid
+import asyncio
+import time
 from typing import Optional, Dict, Any, List, Tuple
 
 import httpx
@@ -172,13 +175,16 @@ STATE: Dict[str, Any] = {
     "page_token": None,
     "channel_id": None,
     "resource_id": None,
-    "expiration_ms": None,
+    "expiration_ms": None,  # epoch ms from Google
     # folder_id -> destination
     "client_map": {},
     # canonical client key -> {"id": folder_id, "name": folder_name}
     "folder_index": {},
     "folder_index_loaded": False,
 }
+
+# Background renew task handle
+RENEW_TASK: Optional[asyncio.Task] = None
 
 # ---------------- HELPERS: TELEGRAM ----------------
 async def tg_call(method: str, payload: dict) -> dict:
@@ -241,9 +247,8 @@ def list_completed_folders() -> List[Dict[str, str]]:
 
 def refresh_folder_index_from_drive() -> None:
     """
-    Rebuilds canonical folder index from Drive.
-    Helps if someone manually adds folders in Drive.
-    We do NOT overwrite DB bindings; we just add missing ones.
+    Adds any missing folders found in Drive to the in-memory folder index.
+    Does NOT overwrite DB bindings; it only fills gaps.
     """
     idx: Dict[str, Dict[str, str]] = {}
     for f in list_completed_folders():
@@ -334,15 +339,92 @@ def start_watch() -> Dict[str, Any]:
     return res
 
 
-# ---------------- STARTUP ----------------
+def renew_watch_now() -> Dict[str, Any]:
+    """
+    Renews the Drive watch and returns raw watch response.
+    Safe to call multiple times.
+    """
+    return start_watch()
+
+
+# ---------------- AUTO-RENEW LOOP ----------------
+async def watch_renewer_loop():
+    """
+    Background loop:
+    - checks expiration_ms
+    - renews if missing or expiring soon
+    """
+    # How early to renew before expiry
+    RENEW_AHEAD_SECONDS = 6 * 60 * 60  # 6 hours
+    # Minimum sleep between checks
+    MIN_CHECK_SECONDS = 15 * 60  # 15 minutes
+    # Max sleep between checks
+    MAX_CHECK_SECONDS = 6 * 60 * 60  # 6 hours
+
+    while True:
+        try:
+            exp_ms = STATE.get("expiration_ms")
+            now_s = int(time.time())
+
+            # If no expiration known, renew soon
+            if not exp_ms:
+                renew_watch_now()
+                # after renewing, re-evaluate on next loop
+                await asyncio.sleep(MIN_CHECK_SECONDS)
+                continue
+
+            exp_s = int(exp_ms / 1000)
+            seconds_left = exp_s - now_s
+
+            # Renew if expiring soon (or already expired)
+            if seconds_left <= RENEW_AHEAD_SECONDS:
+                renew_watch_now()
+                await asyncio.sleep(MIN_CHECK_SECONDS)
+                continue
+
+            # Sleep until it's time to renew, but bounded
+            # wake up earlier in case of restarts/clock drift
+            sleep_s = max(MIN_CHECK_SECONDS, seconds_left - RENEW_AHEAD_SECONDS)
+            sleep_s = min(sleep_s, MAX_CHECK_SECONDS)
+            await asyncio.sleep(sleep_s)
+
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            # If anything unexpected happens, wait a bit and try again
+            await asyncio.sleep(MIN_CHECK_SECONDS)
+
+
+# ---------------- STARTUP / SHUTDOWN ----------------
 @app.on_event("startup")
 async def on_startup():
+    global RENEW_TASK
+
     init_db()
     load_bindings_into_state(STATE)  # ✅ restores /register bindings after deploys
     refresh_folder_index_from_drive()
 
-    start_watch()
+    # Start Telegram webhook
     await ensure_telegram_webhook()
+
+    # Start (or renew) Drive watch immediately on boot
+    renew_watch_now()
+
+    # Start auto-renew background task (no cron needed)
+    if RENEW_TASK is None or RENEW_TASK.done():
+        RENEW_TASK = asyncio.create_task(watch_renewer_loop())
+
+
+@app.on_event("shutdown")
+async def on_shutdown():
+    global RENEW_TASK
+    if RENEW_TASK and not RENEW_TASK.done():
+        RENEW_TASK.cancel()
+        try:
+            await RENEW_TASK
+        except Exception:
+            pass
+    RENEW_TASK = None
 
 
 # ---------------- TELEGRAM WEBHOOK ----------------
@@ -593,17 +675,17 @@ async def drive_webhook(request: Request):
     return {"ok": True, "changes": len(changes), "notified": notified}
 
 
-# ---------------- WATCH RENEW ----------------
+# ---------------- WATCH RENEW (manual, optional) ----------------
 @app.post("/watch/renew")
 def renew_watch(secret: str):
     """
-    Call daily using a cron/uptime ping:
+    Optional manual call:
     POST /watch/renew?secret=WATCH_SECRET
+    Auto-renew already runs in the background.
     """
     if secret != WATCH_SECRET:
         raise HTTPException(status_code=403, detail="forbidden")
-
-    res = start_watch()
+    res = renew_watch_now()
     return {
         "ok": True,
         "watch_channel_id": STATE["channel_id"],
@@ -623,4 +705,5 @@ def health():
         "watch_expiration_ms": STATE["expiration_ms"],
         "client_map_size": len(STATE["client_map"]),
         "folder_index_size": len(STATE["folder_index"]),
+        "auto_renew_running": bool(RENEW_TASK and not RENEW_TASK.done()),
     }
