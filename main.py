@@ -6,32 +6,22 @@
 # ✅ NO Drive delete
 # ✅ Only CONNECTS existing folders to a Telegram Topic
 #
-# Google Drive folder structure (existing):
+# Folder structure:
 #   CLIENTS_ROOT_ID/
-#       <Client Name>/          (example: "Ally Lotti")
-#           OnlyFans ✅         (can be "OnlyFans", "OnlyFans ✅", "✅ OnlyFans", etc.)
-#               Customs         (can be "Customs", "Customs ✅", etc.)
+#       <Client Name>/
+#           OnlyFans ✅ (name contains "onlyfans")
+#               Customs ✅ (name contains "customs")
 #                   ...uploads + subfolders...
 #
 # Telegram:
-# - Add bot to Telegram group (admin)
+# - Add bot to Telegram group
 # - Inside the TOPIC you want notifications in:
-#     /register ally lotti
+#     /register autumn
 #
-# Behavior:
-# - /register finds EXACT client folder under CLIENTS_ROOT_ID (case-insensitive, emoji-safe)
-# - Then finds ONLYFANS folder ONLY inside that client folder (contains "onlyfans")
-# - Then finds CUSTOMS folder ONLY inside that OnlyFans folder (contains "customs")
-# - Notifies only for items created/uploaded under Customs (including subfolders)
-# - If uploaded item is a folder: sends folder name + folder link
-# - Sends full path: Client / OnlyFans / Customs / ... / item
-# - Dedupe by file_id forever
-# - Bindings stored in Postgres (survive redeploy)
-# - Auto-renews Drive watch in background
-#
-# IMPORTANT:
-# - This code NEVER creates or deletes anything in Drive.
-# - /unregister only removes the DB binding, not Drive folders/files.
+# Fixes:
+# - ✅ Do NOT reject webhook by channel/resource (that makes it "work once")
+# - ✅ Persist page_token in Postgres (survive restarts)
+# - ✅ DB reconnect guard
 # ------------------------------------------------------------
 
 import os
@@ -44,12 +34,12 @@ from typing import Optional, Dict, Any, List, Tuple
 
 import httpx
 import psycopg2
+from psycopg2 import OperationalError
 from fastapi import FastAPI, Request, Response, HTTPException
 
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 
-# ---------------- APP ----------------
 app = FastAPI()
 
 # ---------------- ENV ----------------
@@ -60,12 +50,9 @@ TELEGRAM_WEBHOOK_SECRET = os.getenv("TELEGRAM_WEBHOOK_SECRET", "change-me-telegr
 GOOGLE_SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
 WATCH_SECRET = os.getenv("WATCH_SECRET", "change-me-drive-secret")
 
-DATABASE_URL = os.getenv("DATABASE_URL")  # Railway Postgres
-
-# Root folder containing all clients (the parent of "Ally Lotti", "Dan Dangler", etc.)
+DATABASE_URL = os.getenv("DATABASE_URL")
 CLIENTS_ROOT_ID = os.getenv("CLIENTS_ROOT_ID")
 
-# Folder name tokens (we match by CONTAINS inside the proper parent only)
 ONLYFANS_TOKEN = os.getenv("ONLYFANS_TOKEN", "onlyfans")
 CUSTOMS_TOKEN = os.getenv("CUSTOMS_TOKEN", "customs")
 
@@ -74,17 +61,27 @@ if not TELEGRAM_BOT_TOKEN:
 if not BASE_URL:
     raise RuntimeError("Missing env var: BASE_URL")
 if BASE_URL.endswith("/"):
-    raise RuntimeError("BASE_URL must NOT end with '/' (remove trailing slash)")
+    raise RuntimeError("BASE_URL must NOT end with '/'")
 if not GOOGLE_SERVICE_ACCOUNT_JSON:
     raise RuntimeError("Missing env var: GOOGLE_SERVICE_ACCOUNT_JSON")
 if not DATABASE_URL:
-    raise RuntimeError("Missing env var: DATABASE_URL (add Railway Postgres)")
+    raise RuntimeError("Missing env var: DATABASE_URL")
 if not CLIENTS_ROOT_ID:
-    raise RuntimeError("Missing env var: CLIENTS_ROOT_ID (Drive folder ID that contains all client folders)")
+    raise RuntimeError("Missing env var: CLIENTS_ROOT_ID")
 
-# ---------------- DB (POSTGRES) ----------------
-db = psycopg2.connect(DATABASE_URL, sslmode="require")
-db.autocommit = True
+# ---------------- DB CONNECTION (reconnect-safe) ----------------
+_db = None
+
+def get_db():
+    global _db
+    try:
+        if _db is None or getattr(_db, "closed", 1) != 0:
+            _db = psycopg2.connect(DATABASE_URL, sslmode="require")
+            _db.autocommit = True
+    except OperationalError:
+        _db = psycopg2.connect(DATABASE_URL, sslmode="require")
+        _db.autocommit = True
+    return _db
 
 # ---------------- GOOGLE DRIVE CLIENT ----------------
 SCOPES = ["https://www.googleapis.com/auth/drive"]
@@ -99,72 +96,49 @@ STATE: Dict[str, Any] = {
     "page_token": None,
     "channel_id": None,
     "resource_id": None,
-    "expiration_ms": None,  # epoch ms from Google
+    "expiration_ms": None,
 
-    # customs_root_folder_id -> {chat_id, thread_id, client_name, ...}
-    "customs_map": {},
+    "customs_map": {},          # customs_root_id -> {chat_id, thread_id, client_name,...}
+    "bindings_by_client": {},   # client_key -> binding details (for /list)
 
-    # client_key -> binding details (for /list)
-    "bindings_by_client": {},
-
-    # caches (for ancestor checks & pretty paths)
-    "parents_cache": {},  # file_id -> [parent_ids]
-    "name_cache": {},     # file_id -> name
-    "route_cache": {},    # folder_id -> (customs_root_id or None)
+    "parents_cache": {},
+    "name_cache": {},
+    "route_cache": {},
 }
 
 RENEW_TASK: Optional[asyncio.Task] = None
 
-
-# ---------------- TEXT NORMALIZATION ----------------
+# ---------------- NORMALIZATION ----------------
 def canonical_name(name: str) -> str:
-    """
-    Emoji/symbol-safe normalization for matching.
-    - lowercases
-    - removes emojis/special chars
-    - keeps letters/numbers
-    - collapses whitespace
-    Examples:
-      "OnlyFans ✅" -> "onlyfans"
-      "✅ OnlyFans" -> "onlyfans"
-      "Ally   Lotti" -> "ally lotti"
-    """
     name = (name or "").strip().lower()
-    name = re.sub(r"[^a-z0-9]+", " ", name)  # remove emojis/symbols
+    name = re.sub(r"[^a-z0-9]+", " ", name)
     name = re.sub(r"\s+", " ", name).strip()
     return name
-
 
 def normalize_spaces(name: str) -> str:
     name = (name or "").strip()
     name = re.sub(r"\s+", " ", name)
     return name
 
-
-# ---------------- DB INIT ----------------
+# ---------------- DB INIT + APP STATE ----------------
 def init_db() -> None:
+    db = get_db()
     with db.cursor() as cur:
-        # Bindings: connect existing folders only (no Drive create/delete)
         cur.execute(
             """
             CREATE TABLE IF NOT EXISTS bindings (
                 client_key TEXT PRIMARY KEY,
                 client_name TEXT NOT NULL,
-
                 client_folder_id TEXT NOT NULL,
                 onlyfans_folder_id TEXT NOT NULL,
                 customs_folder_id TEXT NOT NULL,
-
                 chat_id BIGINT NOT NULL,
                 thread_id BIGINT NOT NULL,
-
                 created_at TIMESTAMPTZ DEFAULT NOW(),
                 updated_at TIMESTAMPTZ DEFAULT NOW()
             );
             """
         )
-
-        # Dedupe by file_id forever
         cur.execute(
             """
             CREATE TABLE IF NOT EXISTS notified_files (
@@ -173,7 +147,34 @@ def init_db() -> None:
             );
             """
         )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS app_state (
+                k TEXT PRIMARY KEY,
+                v TEXT NOT NULL,
+                updated_at TIMESTAMPTZ DEFAULT NOW()
+            );
+            """
+        )
 
+def state_set(k: str, v: str) -> None:
+    db = get_db()
+    with db.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO app_state (k, v, updated_at)
+            VALUES (%s, %s, NOW())
+            ON CONFLICT (k) DO UPDATE SET v = EXCLUDED.v, updated_at = NOW();
+            """,
+            (k, v),
+        )
+
+def state_get(k: str) -> Optional[str]:
+    db = get_db()
+    with db.cursor() as cur:
+        cur.execute("SELECT v FROM app_state WHERE k=%s;", (k,))
+        row = cur.fetchone()
+        return row[0] if row else None
 
 def save_binding(
     client_key: str,
@@ -184,6 +185,7 @@ def save_binding(
     chat_id: int,
     thread_id: int,
 ) -> None:
+    db = get_db()
     with db.cursor() as cur:
         cur.execute(
             """
@@ -205,19 +207,18 @@ def save_binding(
             (client_key, client_name, client_folder_id, onlyfans_folder_id, customs_folder_id, chat_id, thread_id),
         )
 
-
 def delete_binding(client_key: str) -> bool:
-    # NOTE: DB only. Does NOT touch Drive.
+    db = get_db()
     with db.cursor() as cur:
         cur.execute("DELETE FROM bindings WHERE client_key=%s;", (client_key,))
         return cur.rowcount > 0
 
-
 def load_bindings_into_state() -> None:
     STATE["customs_map"] = {}
     STATE["bindings_by_client"] = {}
-    STATE["route_cache"] = {}  # reset route cache
+    STATE["route_cache"] = {}
 
+    db = get_db()
     with db.cursor() as cur:
         cur.execute(
             """
@@ -245,14 +246,14 @@ def load_bindings_into_state() -> None:
             "customs_folder_id": customs_folder_id,
         }
 
-
 def was_file_notified(file_id: str) -> bool:
+    db = get_db()
     with db.cursor() as cur:
         cur.execute("SELECT 1 FROM notified_files WHERE file_id=%s;", (file_id,))
         return cur.fetchone() is not None
 
-
 def mark_file_notified(file_id: str) -> None:
+    db = get_db()
     with db.cursor() as cur:
         cur.execute(
             """
@@ -261,7 +262,6 @@ def mark_file_notified(file_id: str) -> None:
             """,
             (file_id,),
         )
-
 
 # ---------------- TELEGRAM HELPERS ----------------
 async def tg_call(method: str, payload: dict) -> dict:
@@ -272,18 +272,15 @@ async def tg_call(method: str, payload: dict) -> dict:
             raise RuntimeError(f"Telegram API error: {r.status_code} {r.text}")
         return r.json()
 
-
 async def tg_send(chat_id: int, text: str, thread_id: Optional[int] = None) -> None:
     payload = {"chat_id": chat_id, "text": text, "disable_web_page_preview": False}
     if thread_id is not None:
         payload["message_thread_id"] = thread_id
     await tg_call("sendMessage", payload)
 
-
 async def ensure_telegram_webhook() -> None:
     hook_url = f"{BASE_URL}/telegram/webhook/{TELEGRAM_WEBHOOK_SECRET}"
     await tg_call("setWebhook", {"url": hook_url})
-
 
 # ---------------- DRIVE LISTING (NO CREATE/DELETE) ----------------
 def drive_files_list(q: str, page_size: int = 1000) -> List[Dict[str, str]]:
@@ -293,7 +290,7 @@ def drive_files_list(q: str, page_size: int = 1000) -> List[Dict[str, str]]:
         res = drive.files().list(
             q=q,
             pageSize=page_size,
-            fields="nextPageToken, files(id,name,mimeType)",
+            fields="nextPageToken, files(id,name,mimeType,parents)",
             pageToken=page_token,
             includeItemsFromAllDrives=True,
             supportsAllDrives=True,
@@ -304,74 +301,44 @@ def drive_files_list(q: str, page_size: int = 1000) -> List[Dict[str, str]]:
             break
     return out
 
-
 def drive_list_child_folders(parent_id: str) -> List[Dict[str, str]]:
-    q = (
-        f"'{parent_id}' in parents "
-        f"and mimeType = '{FOLDER_MIME}' "
-        f"and trashed = false"
-    )
+    q = f"'{parent_id}' in parents and mimeType = '{FOLDER_MIME}' and trashed = false"
     files = drive_files_list(q=q)
     return [{"id": f["id"], "name": f.get("name", "")} for f in files]
 
-
 def drive_find_client_folder_exact_under_root(client_name: str) -> Optional[Dict[str, str]]:
-    """
-    Finds <Client Name> folder ONLY under CLIENTS_ROOT_ID.
-    Must match EXACT (after canonical_name normalization).
-    This ensures we never accidentally pick an OnlyFans elsewhere.
-    """
     target = canonical_name(client_name)
     if not target:
         return None
-
     for f in drive_list_child_folders(CLIENTS_ROOT_ID):
         if canonical_name(f.get("name", "")) == target:
             return {"id": f["id"], "name": f.get("name", "")}
     return None
 
-
 def drive_find_child_folder_contains(parent_id: str, token: str) -> Optional[Dict[str, str]]:
-    """
-    Finds a child folder under a SPECIFIC parent whose canonical name CONTAINS token.
-    Example token="onlyfans" matches:
-      "OnlyFans ✅", "✅ OnlyFans", "OnlyFans (Main)", etc.
-    """
     t = canonical_name(token)
     if not t:
         return None
-
     for f in drive_list_child_folders(parent_id):
         n = canonical_name(f.get("name", ""))
         if t in n:
             return {"id": f["id"], "name": f.get("name", "")}
     return None
 
-
 def find_client_onlyfans_customs(client_input: str) -> Tuple[str, str, str, str, str]:
-    """
-    Returns:
-      (client_folder_id, client_folder_name, onlyfans_folder_id, customs_folder_id, customs_folder_name)
-
-    Guarantees:
-    - OnlyFans is searched ONLY inside the matched client folder under CLIENTS_ROOT_ID.
-    - Customs is searched ONLY inside that OnlyFans folder.
-    - NO create / NO delete in Drive.
-    """
     client = drive_find_client_folder_exact_under_root(client_input)
     if not client:
-        raise ValueError(f"Client folder does not exist under root: {client_input}")
+        raise ValueError("client_not_found")
 
     onlyfans = drive_find_child_folder_contains(client["id"], ONLYFANS_TOKEN)
     if not onlyfans:
-        raise ValueError(f"OnlyFans folder does not exist inside client: {client['name']}")
+        raise ValueError("onlyfans_not_found")
 
     customs = drive_find_child_folder_contains(onlyfans["id"], CUSTOMS_TOKEN)
     if not customs:
-        raise ValueError(f"Customs folder does not exist inside: {client['name']} / {onlyfans['name']}")
+        raise ValueError("customs_not_found")
 
     return client["id"], client["name"], onlyfans["id"], customs["id"], customs["name"]
-
 
 def drive_get_file_min(file_id: str) -> Dict[str, Any]:
     res = drive.files().get(
@@ -383,7 +350,6 @@ def drive_get_file_min(file_id: str) -> Dict[str, Any]:
     STATE["parents_cache"][file_id] = res.get("parents") or []
     return res
 
-
 def get_parents_cached(file_id: str) -> List[str]:
     if file_id in STATE["parents_cache"]:
         return STATE["parents_cache"][file_id] or []
@@ -394,7 +360,6 @@ def get_parents_cached(file_id: str) -> List[str]:
         STATE["parents_cache"][file_id] = []
         return []
 
-
 def get_name_cached(file_id: str) -> str:
     if file_id in STATE["name_cache"] and STATE["name_cache"][file_id]:
         return STATE["name_cache"][file_id]
@@ -404,18 +369,12 @@ def get_name_cached(file_id: str) -> str:
     except Exception:
         return "(no name)"
 
-
 def make_drive_link(file_id: str, mime_type: Optional[str]) -> str:
     if mime_type == FOLDER_MIME:
         return f"https://drive.google.com/drive/folders/{file_id}"
     return f"https://drive.google.com/file/d/{file_id}/view"
 
-
 def find_registered_customs_root(start_parent_id: str) -> Optional[str]:
-    """
-    Walk up ancestors from a folder and see if it's under a registered Customs root.
-    Returns customs_root_id if found.
-    """
     if start_parent_id in STATE["route_cache"]:
         return STATE["route_cache"][start_parent_id]
 
@@ -439,12 +398,7 @@ def find_registered_customs_root(start_parent_id: str) -> Optional[str]:
         STATE["route_cache"][v] = None
     return None
 
-
 def build_path_from_customs(customs_root_id: str, item_parent_id: str, item_name: str, client_name: str) -> str:
-    """
-    Client / OnlyFans / Customs / ... / item
-    We don't assume the exact OnlyFans name; we show the real names from Drive cache.
-    """
     parts = []
     cur = item_parent_id
     visited = set()
@@ -462,14 +416,10 @@ def build_path_from_customs(customs_root_id: str, item_parent_id: str, item_name
         return f"{client_name} / {customs_name} / " + " / ".join(parts) + f" / {item_name}"
     return f"{client_name} / {customs_name} / {item_name}"
 
-
 # ---------------- DRIVE WATCH & CHANGES ----------------
 def get_start_page_token() -> str:
-    res = drive.changes().getStartPageToken(
-        supportsAllDrives=True
-    ).execute()
+    res = drive.changes().getStartPageToken(supportsAllDrives=True).execute()
     return res["startPageToken"]
-
 
 def list_changes(page_token: str) -> Tuple[List[dict], str]:
     res = drive.changes().list(
@@ -484,10 +434,16 @@ def list_changes(page_token: str) -> Tuple[List[dict], str]:
     new_token = res.get("newStartPageToken") or res.get("nextPageToken") or page_token
     return changes, new_token
 
-
 def start_watch() -> Dict[str, Any]:
+    # load persisted page token if present
+    if not STATE["page_token"]:
+        saved = state_get("page_token")
+        if saved:
+            STATE["page_token"] = saved
+
     if not STATE["page_token"]:
         STATE["page_token"] = get_start_page_token()
+        state_set("page_token", STATE["page_token"])
 
     channel_id = str(uuid.uuid4())
     webhook_url = f"{BASE_URL}/drive/webhook?secret={WATCH_SECRET}"
@@ -502,18 +458,22 @@ def start_watch() -> Dict[str, Any]:
     STATE["channel_id"] = channel_id
     STATE["resource_id"] = res.get("resourceId")
     STATE["expiration_ms"] = int(res.get("expiration", "0")) if res.get("expiration") else None
-    return res
 
+    # optional store (debug)
+    state_set("channel_id", STATE["channel_id"])
+    state_set("resource_id", STATE["resource_id"] or "")
+    state_set("expiration_ms", str(STATE["expiration_ms"] or ""))
+
+    return res
 
 def renew_watch_now() -> Dict[str, Any]:
     return start_watch()
 
-
 # ---------------- AUTO-RENEW LOOP ----------------
 async def watch_renewer_loop():
-    RENEW_AHEAD_SECONDS = 6 * 60 * 60  # 6 hours
-    MIN_CHECK_SECONDS = 15 * 60        # 15 minutes
-    MAX_CHECK_SECONDS = 6 * 60 * 60    # 6 hours
+    RENEW_AHEAD_SECONDS = 6 * 60 * 60
+    MIN_CHECK_SECONDS = 15 * 60
+    MAX_CHECK_SECONDS = 6 * 60 * 60
 
     while True:
         try:
@@ -542,20 +502,17 @@ async def watch_renewer_loop():
         except Exception:
             await asyncio.sleep(MIN_CHECK_SECONDS)
 
-
 # ---------------- STARTUP / SHUTDOWN ----------------
 @app.on_event("startup")
 async def on_startup():
     global RENEW_TASK
     init_db()
     load_bindings_into_state()
-
     await ensure_telegram_webhook()
     renew_watch_now()
 
     if RENEW_TASK is None or RENEW_TASK.done():
         RENEW_TASK = asyncio.create_task(watch_renewer_loop())
-
 
 @app.on_event("shutdown")
 async def on_shutdown():
@@ -568,7 +525,6 @@ async def on_shutdown():
             pass
     RENEW_TASK = None
 
-
 # ---------------- TELEGRAM WEBHOOK ----------------
 @app.post("/telegram/webhook/{secret}")
 async def telegram_webhook(secret: str, request: Request):
@@ -577,7 +533,6 @@ async def telegram_webhook(secret: str, request: Request):
 
     update = await request.json()
 
-    # avoid spam join events
     if "my_chat_member" in update:
         return {"ok": True}
 
@@ -592,7 +547,7 @@ async def telegram_webhook(secret: str, request: Request):
     chat = msg["chat"]
     chat_id = chat["id"]
     chat_type = chat.get("type")
-    thread_id = msg.get("message_thread_id")  # Topics only
+    thread_id = msg.get("message_thread_id")
 
     sender = msg.get("from") or {}
     user_id = sender.get("id")
@@ -602,10 +557,9 @@ async def telegram_webhook(secret: str, request: Request):
             r = await tg_call("getChatMember", {"chat_id": chat_id, "user_id": user_id})
             status = r.get("result", {}).get("status")
             return status in ("administrator", "creator")
-        except:
+        except Exception:
             return False
 
-    # ---------- /register ----------
     if text.lower().startswith("/register"):
         if chat_type not in ("group", "supergroup"):
             await tg_send(chat_id, "Use /register inside a Telegram group.")
@@ -623,13 +577,8 @@ async def telegram_webhook(secret: str, request: Request):
         if len(parts) < 2 or not parts[1].strip():
             await tg_send(
                 chat_id,
-                "✅ Connect THIS Topic to an existing client's Customs folder:\n"
-                "/register <client name>\n\n"
-                "Example:\n"
-                "/register ally lotti\n\n"
-                "This bot will NOT create or delete anything in Drive.\n"
-                "It only connects to:\n"
-                "<Client> / OnlyFans / Customs",
+                "✅ Connect THIS Topic:\n/register <client name>\n\nExample:\n/register autumn\n\n"
+                "This bot does NOT create/delete anything in Drive.",
                 thread_id=thread_id,
             )
             return {"ok": True}
@@ -642,16 +591,13 @@ async def telegram_webhook(secret: str, request: Request):
         except Exception:
             await tg_send(
                 chat_id,
-                "❌ Folder does not exist.\n\n"
-                "Expected path (inside your Clients root):\n"
+                "❌ Folder does not exist.\n\nExpected:\n"
                 f"{client_input} / (OnlyFans...) / (Customs...)\n\n"
-                "✅ Note: OnlyFans can be like 'OnlyFans ✅' and still works.\n"
-                "Please check the folder spelling under the Clients root.",
+                "✅ OnlyFans/Customs can include ✅ and still match.",
                 thread_id=thread_id,
             )
             return {"ok": True}
 
-        # Save binding (DB only)
         save_binding(
             client_key=client_key,
             client_name=client_folder_name,
@@ -667,13 +613,12 @@ async def telegram_webhook(secret: str, request: Request):
             chat_id,
             "✅ Connected successfully!\n"
             f"📁 Connected to: {client_folder_name}\n"
-            f"🔗 Watching: {client_folder_name} / {get_name_cached(onlyfans_id) if onlyfans_id else 'OnlyFans'} / {customs_name}\n"
+            f"🔗 Watching: {client_folder_name} / {get_name_cached(onlyfans_id)} / {customs_name}\n"
             "📌 Notifications will be sent in this topic.",
             thread_id=thread_id,
         )
         return {"ok": True}
 
-    # ---------- /unregister ----------
     if text.lower().startswith("/unregister"):
         if chat_type not in ("group", "supergroup"):
             await tg_send(chat_id, "Use /unregister inside a Telegram group.")
@@ -687,7 +632,7 @@ async def telegram_webhook(secret: str, request: Request):
 
         parts = text.split(maxsplit=1)
         if len(parts) < 2 or not parts[1].strip():
-            await tg_send(chat_id, "Usage: /unregister <client name>\nExample: /unregister ally lotti", thread_id=thread_id)
+            await tg_send(chat_id, "Usage: /unregister <client name>", thread_id=thread_id)
             return {"ok": True}
 
         key = canonical_name(parts[1].strip())
@@ -701,45 +646,46 @@ async def telegram_webhook(secret: str, request: Request):
         )
         return {"ok": True}
 
-    # ---------- /list ----------
     if text.lower().startswith("/list"):
         lines = []
         for k, b in STATE["bindings_by_client"].items():
-            lines.append(
-                f"- {b['client_name']} | key={k} | customs_folder_id={b['customs_folder_id']} | chat_id={b['chat_id']} | thread_id={b['thread_id']}"
-            )
-        await tg_send(chat_id, "📌 Current bindings:\n" + ("\n".join(lines) if lines else "(none yet)"), thread_id=thread_id)
+            lines.append(f"- {b['client_name']} | key={k} | customs_id={b['customs_folder_id']}")
+        await tg_send(chat_id, "📌 Current bindings:\n" + ("\n".join(lines) if lines else "(none)"), thread_id=thread_id)
         return {"ok": True}
 
     return {"ok": True}
 
-
 # ---------------- DRIVE WEBHOOK ----------------
 @app.post("/drive/webhook")
 async def drive_webhook(request: Request):
+    # Security check
     secret = request.query_params.get("secret")
     if secret != WATCH_SECRET:
         return Response(status_code=403)
 
-    channel_id = request.headers.get("X-Goog-Channel-Id")
-    resource_id = request.headers.get("X-Goog-Resource-Id")
+    # NOTE:
+    # We intentionally do NOT reject by channel_id/resource_id.
+    # Those change on renew/restart and will make the bot "work once".
+
     resource_state = request.headers.get("X-Goog-Resource-State")
-
-    # Validate watch
-    if channel_id != STATE["channel_id"] or resource_id != STATE["resource_id"]:
-        return Response(status_code=200)
-
-    # Initial sync ping
     if resource_state == "sync":
         return Response(status_code=200)
 
-    old_token = STATE["page_token"]
+    old_token = STATE.get("page_token")
+    if not old_token:
+        saved = state_get("page_token")
+        if saved:
+            old_token = saved
+            STATE["page_token"] = saved
+
     if not old_token:
         STATE["page_token"] = get_start_page_token()
+        state_set("page_token", STATE["page_token"])
         return {"ok": True, "notified": 0}
 
     changes, new_token = list_changes(old_token)
     STATE["page_token"] = new_token
+    state_set("page_token", new_token)
 
     notified = 0
 
@@ -752,7 +698,6 @@ async def drive_webhook(request: Request):
         if not file_id:
             continue
 
-        # dedupe
         if was_file_notified(file_id):
             continue
 
@@ -760,14 +705,12 @@ async def drive_webhook(request: Request):
         mime_type = f.get("mimeType")
         parents = f.get("parents") or []
 
-        # cache basic meta
         STATE["name_cache"][file_id] = file_name
         STATE["parents_cache"][file_id] = parents
 
         if not parents:
             continue
 
-        # Check if item is inside ANY registered customs folder (including subfolders)
         customs_root_id = None
         for p in parents:
             customs_root_id = find_registered_customs_root(p)
@@ -792,29 +735,21 @@ async def drive_webhook(request: Request):
         link = f.get("webViewLink") or make_drive_link(file_id, mime_type)
 
         if mime_type == FOLDER_MIME:
-            text = (
-                "📂 New folder created\n"
-                f"🧾 {full_path}\n"
-                f"🔗 {link}"
-            )
+            text = f"📂 New folder\n🧾 {full_path}\n🔗 {link}"
         else:
-            text = (
-                "✅ New upload\n"
-                f"🧾 {full_path}\n"
-                f"🔗 {link}"
-            )
+            text = f"✅ New upload\n🧾 {full_path}\n🔗 {link}"
 
         try:
             await tg_send(dest["chat_id"], text, thread_id=dest.get("thread_id"))
             mark_file_notified(file_id)
             notified += 1
         except Exception:
+            # don’t mark notified if TG failed
             continue
 
     return {"ok": True, "changes": len(changes), "notified": notified}
 
-
-# ---------------- WATCH RENEW (optional manual) ----------------
+# ---------------- WATCH RENEW ----------------
 @app.post("/watch/renew")
 def renew_watch(secret: str):
     if secret != WATCH_SECRET:
@@ -828,7 +763,6 @@ def renew_watch(secret: str):
         "raw": res,
     }
 
-
 # ---------------- HEALTH ----------------
 @app.get("/")
 def health():
@@ -837,6 +771,7 @@ def health():
         "watch_channel_id": STATE["channel_id"],
         "watch_resource_id": STATE["resource_id"],
         "watch_expiration_ms": STATE["expiration_ms"],
+        "page_token_set": bool(STATE.get("page_token")),
         "bindings_count": len(STATE["bindings_by_client"]),
         "auto_renew_running": bool(RENEW_TASK and not RENEW_TASK.done()),
         "note": "This bot never creates/deletes anything in Drive.",
