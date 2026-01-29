@@ -44,7 +44,6 @@ from typing import Optional, Dict, Any, List, Tuple
 
 import httpx
 import psycopg2
-from psycopg2.pool import SimpleConnectionPool
 from fastapi import FastAPI, Request, Response, HTTPException
 
 from google.oauth2 import service_account
@@ -83,58 +82,9 @@ if not DATABASE_URL:
 if not CLIENTS_ROOT_ID:
     raise RuntimeError("Missing env var: CLIENTS_ROOT_ID (Drive folder ID that contains all client folders)")
 
-# ---------------- DB POOL (fixes 'connection already closed') ----------------
-DB_POOL: Optional[SimpleConnectionPool] = None
-
-
-def init_db_pool() -> None:
-    """
-    Create a small connection pool. This avoids stale global connections
-    and fixes psycopg2.InterfaceError: connection already closed.
-    """
-    global DB_POOL
-    if DB_POOL is None:
-        DB_POOL = SimpleConnectionPool(
-            minconn=1,
-            maxconn=5,
-            dsn=DATABASE_URL,
-            sslmode="require",
-        )
-
-
-def db_exec(fn):
-    """
-    Run a DB operation using a pooled connection.
-    If the pool has stale connections (after wipe/redeploy), rebuild once.
-    """
-    global DB_POOL
-    if DB_POOL is None:
-        init_db_pool()
-
-    conn = None
-    try:
-        conn = DB_POOL.getconn()
-        conn.autocommit = True
-        return fn(conn)
-    except psycopg2.InterfaceError:
-        # stale conn/pool — rebuild once
-        try:
-            if DB_POOL:
-                DB_POOL.closeall()
-        except Exception:
-            pass
-        DB_POOL = None
-        init_db_pool()
-        conn = DB_POOL.getconn()
-        conn.autocommit = True
-        return fn(conn)
-    finally:
-        if conn is not None and DB_POOL is not None:
-            try:
-                DB_POOL.putconn(conn)
-            except Exception:
-                pass
-
+# ---------------- DB (POSTGRES) ----------------
+db = psycopg2.connect(DATABASE_URL, sslmode="require")
+db.autocommit = True
 
 # ---------------- GOOGLE DRIVE CLIENT ----------------
 SCOPES = ["https://www.googleapis.com/auth/drive"]
@@ -165,6 +115,7 @@ STATE: Dict[str, Any] = {
 
 RENEW_TASK: Optional[asyncio.Task] = None
 
+
 # ---------------- TEXT NORMALIZATION ----------------
 def canonical_name(name: str) -> str:
     """
@@ -192,37 +143,36 @@ def normalize_spaces(name: str) -> str:
 
 # ---------------- DB INIT ----------------
 def init_db() -> None:
-    def _run(conn):
-        with conn.cursor() as cur:
-            # Bindings: connect existing folders only (no Drive create/delete)
-            cur.execute(
-                """
-                CREATE TABLE IF NOT EXISTS bindings (
-                    client_key TEXT PRIMARY KEY,
-                    client_name TEXT NOT NULL,
+    with db.cursor() as cur:
+        # Bindings: connect existing folders only (no Drive create/delete)
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS bindings (
+                client_key TEXT PRIMARY KEY,
+                client_name TEXT NOT NULL,
 
-                    client_folder_id TEXT NOT NULL,
-                    onlyfans_folder_id TEXT NOT NULL,
-                    customs_folder_id TEXT NOT NULL,
+                client_folder_id TEXT NOT NULL,
+                onlyfans_folder_id TEXT NOT NULL,
+                customs_folder_id TEXT NOT NULL,
 
-                    chat_id BIGINT NOT NULL,
-                    thread_id BIGINT NOT NULL,
+                chat_id BIGINT NOT NULL,
+                thread_id BIGINT NOT NULL,
 
-                    created_at TIMESTAMPTZ DEFAULT NOW(),
-                    updated_at TIMESTAMPTZ DEFAULT NOW()
-                );
-                """
-            )
-            # Dedupe by file_id forever
-            cur.execute(
-                """
-                CREATE TABLE IF NOT EXISTS notified_files (
-                    file_id TEXT PRIMARY KEY,
-                    notified_at TIMESTAMPTZ DEFAULT NOW()
-                );
-                """
-            )
-    db_exec(_run)
+                created_at TIMESTAMPTZ DEFAULT NOW(),
+                updated_at TIMESTAMPTZ DEFAULT NOW()
+            );
+            """
+        )
+
+        # Dedupe by file_id forever
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS notified_files (
+                file_id TEXT PRIMARY KEY,
+                notified_at TIMESTAMPTZ DEFAULT NOW()
+            );
+            """
+        )
 
 
 def save_binding(
@@ -234,37 +184,33 @@ def save_binding(
     chat_id: int,
     thread_id: int,
 ) -> None:
-    def _run(conn):
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                INSERT INTO bindings (
-                    client_key, client_name,
-                    client_folder_id, onlyfans_folder_id, customs_folder_id,
-                    chat_id, thread_id, updated_at
-                )
-                VALUES (%s,%s,%s,%s,%s,%s,%s,NOW())
-                ON CONFLICT (client_key) DO UPDATE SET
-                    client_name = EXCLUDED.client_name,
-                    client_folder_id = EXCLUDED.client_folder_id,
-                    onlyfans_folder_id = EXCLUDED.onlyfans_folder_id,
-                    customs_folder_id = EXCLUDED.customs_folder_id,
-                    chat_id = EXCLUDED.chat_id,
-                    thread_id = EXCLUDED.thread_id,
-                    updated_at = NOW();
-                """,
-                (client_key, client_name, client_folder_id, onlyfans_folder_id, customs_folder_id, chat_id, thread_id),
+    with db.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO bindings (
+                client_key, client_name,
+                client_folder_id, onlyfans_folder_id, customs_folder_id,
+                chat_id, thread_id, updated_at
             )
-    db_exec(_run)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,NOW())
+            ON CONFLICT (client_key) DO UPDATE SET
+                client_name = EXCLUDED.client_name,
+                client_folder_id = EXCLUDED.client_folder_id,
+                onlyfans_folder_id = EXCLUDED.onlyfans_folder_id,
+                customs_folder_id = EXCLUDED.customs_folder_id,
+                chat_id = EXCLUDED.chat_id,
+                thread_id = EXCLUDED.thread_id,
+                updated_at = NOW();
+            """,
+            (client_key, client_name, client_folder_id, onlyfans_folder_id, customs_folder_id, chat_id, thread_id),
+        )
 
 
 def delete_binding(client_key: str) -> bool:
     # NOTE: DB only. Does NOT touch Drive.
-    def _run(conn):
-        with conn.cursor() as cur:
-            cur.execute("DELETE FROM bindings WHERE client_key=%s;", (client_key,))
-            return cur.rowcount > 0
-    return bool(db_exec(_run))
+    with db.cursor() as cur:
+        cur.execute("DELETE FROM bindings WHERE client_key=%s;", (client_key,))
+        return cur.rowcount > 0
 
 
 def load_bindings_into_state() -> None:
@@ -272,17 +218,14 @@ def load_bindings_into_state() -> None:
     STATE["bindings_by_client"] = {}
     STATE["route_cache"] = {}  # reset route cache
 
-    def _run(conn):
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                SELECT client_key, client_name, client_folder_id, onlyfans_folder_id, customs_folder_id, chat_id, thread_id
-                FROM bindings;
-                """
-            )
-            return cur.fetchall()
-
-    rows = db_exec(_run) or []
+    with db.cursor() as cur:
+        cur.execute(
+            """
+            SELECT client_key, client_name, client_folder_id, onlyfans_folder_id, customs_folder_id, chat_id, thread_id
+            FROM bindings;
+            """
+        )
+        rows = cur.fetchall()
 
     for (client_key, client_name, client_folder_id, onlyfans_folder_id, customs_folder_id, chat_id, thread_id) in rows:
         STATE["bindings_by_client"][client_key] = {
@@ -304,24 +247,20 @@ def load_bindings_into_state() -> None:
 
 
 def was_file_notified(file_id: str) -> bool:
-    def _run(conn):
-        with conn.cursor() as cur:
-            cur.execute("SELECT 1 FROM notified_files WHERE file_id=%s;", (file_id,))
-            return cur.fetchone() is not None
-    return bool(db_exec(_run))
+    with db.cursor() as cur:
+        cur.execute("SELECT 1 FROM notified_files WHERE file_id=%s;", (file_id,))
+        return cur.fetchone() is not None
 
 
 def mark_file_notified(file_id: str) -> None:
-    def _run(conn):
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                INSERT INTO notified_files (file_id) VALUES (%s)
-                ON CONFLICT (file_id) DO NOTHING;
-                """,
-                (file_id,),
-            )
-    db_exec(_run)
+    with db.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO notified_files (file_id) VALUES (%s)
+            ON CONFLICT (file_id) DO NOTHING;
+            """,
+            (file_id,),
+        )
 
 
 # ---------------- TELEGRAM HELPERS ----------------
@@ -380,6 +319,7 @@ def drive_find_client_folder_exact_under_root(client_name: str) -> Optional[Dict
     """
     Finds <Client Name> folder ONLY under CLIENTS_ROOT_ID.
     Must match EXACT (after canonical_name normalization).
+    This ensures we never accidentally pick an OnlyFans elsewhere.
     """
     target = canonical_name(client_name)
     if not target:
@@ -394,6 +334,8 @@ def drive_find_client_folder_exact_under_root(client_name: str) -> Optional[Dict
 def drive_find_child_folder_contains(parent_id: str, token: str) -> Optional[Dict[str, str]]:
     """
     Finds a child folder under a SPECIFIC parent whose canonical name CONTAINS token.
+    Example token="onlyfans" matches:
+      "OnlyFans ✅", "✅ OnlyFans", "OnlyFans (Main)", etc.
     """
     t = canonical_name(token)
     if not t:
@@ -410,6 +352,11 @@ def find_client_onlyfans_customs(client_input: str) -> Tuple[str, str, str, str,
     """
     Returns:
       (client_folder_id, client_folder_name, onlyfans_folder_id, customs_folder_id, customs_folder_name)
+
+    Guarantees:
+    - OnlyFans is searched ONLY inside the matched client folder under CLIENTS_ROOT_ID.
+    - Customs is searched ONLY inside that OnlyFans folder.
+    - NO create / NO delete in Drive.
     """
     client = drive_find_client_folder_exact_under_root(client_input)
     if not client:
@@ -495,8 +442,8 @@ def find_registered_customs_root(start_parent_id: str) -> Optional[str]:
 
 def build_path_from_customs(customs_root_id: str, item_parent_id: str, item_name: str, client_name: str) -> str:
     """
-    Client / Customs / ... / item
-    (We show the real names from Drive cache.)
+    Client / OnlyFans / Customs / ... / item
+    We don't assume the exact OnlyFans name; we show the real names from Drive cache.
     """
     parts = []
     cur = item_parent_id
@@ -518,7 +465,9 @@ def build_path_from_customs(customs_root_id: str, item_parent_id: str, item_name
 
 # ---------------- DRIVE WATCH & CHANGES ----------------
 def get_start_page_token() -> str:
-    res = drive.changes().getStartPageToken(supportsAllDrives=True).execute()
+    res = drive.changes().getStartPageToken(
+        supportsAllDrives=True
+    ).execute()
     return res["startPageToken"]
 
 
@@ -598,8 +547,6 @@ async def watch_renewer_loop():
 @app.on_event("startup")
 async def on_startup():
     global RENEW_TASK
-
-    init_db_pool()
     init_db()
     load_bindings_into_state()
 
