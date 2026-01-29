@@ -1,27 +1,37 @@
 # main.py
 # ------------------------------------------------------------
 # CUSTOMS BOT (Railway + Postgres)
-# Google Drive -> Push webhook -> Changes API -> Telegram Topic
 #
-# ✅ Add bot to Telegram group (make admin)
-# ✅ Inside a TOPIC, type:
-#    /register autumn
-#    /register Autumn
-#    /register miss lexa
+# ✅ NO Drive create
+# ✅ NO Drive delete
+# ✅ Only CONNECTS existing folders to a Telegram Topic
+#
+# Google Drive folder structure (existing):
+#   CLIENTS_ROOT_ID/
+#       <Client Name>/          (example: "Ally Lotti")
+#           OnlyFans ✅         (can be "OnlyFans", "OnlyFans ✅", "✅ OnlyFans", etc.)
+#               Customs         (can be "Customs", "Customs ✅", etc.)
+#                   ...uploads + subfolders...
+#
+# Telegram:
+# - Add bot to Telegram group (admin)
+# - Inside the TOPIC you want notifications in:
+#     /register ally lotti
 #
 # Behavior:
-# - Case-insensitive, multi-word supported
-# - Auto-creates Drive folder under: /Custom Orders/Completed/<client name> (if missing)
-# - If folder exists (any case), reuses it (no duplicates)
-# - Binds notifications to THAT GROUP + THAT TOPIC thread only
-# - ✅ Persist bindings in Postgres (redeploy/edit won't erase)
-# - ✅ DEDUPE by file_id (one notification per file forever)
-# - ✅ AUTO-RENEW Drive watch in the background (no cron needed)
+# - /register finds EXACT client folder under CLIENTS_ROOT_ID (case-insensitive, emoji-safe)
+# - Then finds ONLYFANS folder ONLY inside that client folder (contains "onlyfans")
+# - Then finds CUSTOMS folder ONLY inside that OnlyFans folder (contains "customs")
+# - Notifies only for items created/uploaded under Customs (including subfolders)
+# - If uploaded item is a folder: sends folder name + folder link
+# - Sends full path: Client / OnlyFans / Customs / ... / item
+# - Dedupe by file_id forever
+# - Bindings stored in Postgres (survive redeploy)
+# - Auto-renews Drive watch in background
 #
 # IMPORTANT:
-# 1) Service account MUST have Editor access to the Completed folder to create subfolders.
-# 2) BASE_URL must NOT end with a slash.
-# 3) Railway may run more than one instance; this code is safe (duplicate renews are okay).
+# - This code NEVER creates or deletes anything in Drive.
+# - /unregister only removes the DB binding, not Drive folders/files.
 # ------------------------------------------------------------
 
 import os
@@ -44,14 +54,20 @@ app = FastAPI()
 
 # ---------------- ENV ----------------
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-BASE_URL = os.getenv("BASE_URL")  # e.g. https://your-app.up.railway.app (NO trailing slash)
+BASE_URL = os.getenv("BASE_URL")  # NO trailing slash
 TELEGRAM_WEBHOOK_SECRET = os.getenv("TELEGRAM_WEBHOOK_SECRET", "change-me-telegram-secret")
 
 GOOGLE_SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
-COMPLETED_FOLDER_ID = os.getenv("COMPLETED_FOLDER_ID")  # folder ID of /Custom Orders/Completed
 WATCH_SECRET = os.getenv("WATCH_SECRET", "change-me-drive-secret")
 
 DATABASE_URL = os.getenv("DATABASE_URL")  # Railway Postgres
+
+# Root folder containing all clients (the parent of "Ally Lotti", "Dan Dangler", etc.)
+CLIENTS_ROOT_ID = os.getenv("CLIENTS_ROOT_ID")
+
+# Folder name tokens (we match by CONTAINS inside the proper parent only)
+ONLYFANS_TOKEN = os.getenv("ONLYFANS_TOKEN", "onlyfans")
+CUSTOMS_TOKEN = os.getenv("CUSTOMS_TOKEN", "customs")
 
 if not TELEGRAM_BOT_TOKEN:
     raise RuntimeError("Missing env var: TELEGRAM_BOT_TOKEN")
@@ -61,108 +77,16 @@ if BASE_URL.endswith("/"):
     raise RuntimeError("BASE_URL must NOT end with '/' (remove trailing slash)")
 if not GOOGLE_SERVICE_ACCOUNT_JSON:
     raise RuntimeError("Missing env var: GOOGLE_SERVICE_ACCOUNT_JSON")
-if not COMPLETED_FOLDER_ID:
-    raise RuntimeError("Missing env var: COMPLETED_FOLDER_ID")
 if not DATABASE_URL:
     raise RuntimeError("Missing env var: DATABASE_URL (add Railway Postgres)")
+if not CLIENTS_ROOT_ID:
+    raise RuntimeError("Missing env var: CLIENTS_ROOT_ID (Drive folder ID that contains all client folders)")
 
 # ---------------- DB (POSTGRES) ----------------
 db = psycopg2.connect(DATABASE_URL, sslmode="require")
 db.autocommit = True
 
-
-def init_db() -> None:
-    with db.cursor() as cur:
-        # Persisted bindings
-        cur.execute(
-            """
-        CREATE TABLE IF NOT EXISTS bindings (
-            client_key TEXT PRIMARY KEY,
-            folder_id TEXT NOT NULL,
-            folder_name TEXT NOT NULL,
-            chat_id BIGINT NOT NULL,
-            thread_id BIGINT NOT NULL,
-            created_at TIMESTAMPTZ DEFAULT NOW(),
-            updated_at TIMESTAMPTZ DEFAULT NOW()
-        );
-        """
-        )
-        # Dedupe notifications forever by file_id
-        cur.execute(
-            """
-        CREATE TABLE IF NOT EXISTS notified_files (
-            file_id TEXT PRIMARY KEY,
-            notified_at TIMESTAMPTZ DEFAULT NOW()
-        );
-        """
-        )
-
-
-def save_binding(client_key: str, folder_id: str, folder_name: str, chat_id: int, thread_id: int) -> None:
-    with db.cursor() as cur:
-        cur.execute(
-            """
-        INSERT INTO bindings (client_key, folder_id, folder_name, chat_id, thread_id, updated_at)
-        VALUES (%s, %s, %s, %s, %s, NOW())
-        ON CONFLICT (client_key) DO UPDATE SET
-            folder_id = EXCLUDED.folder_id,
-            folder_name = EXCLUDED.folder_name,
-            chat_id = EXCLUDED.chat_id,
-            thread_id = EXCLUDED.thread_id,
-            updated_at = NOW();
-        """,
-            (client_key, folder_id, folder_name, chat_id, thread_id),
-        )
-
-
-def delete_binding(client_key: str) -> bool:
-    with db.cursor() as cur:
-        cur.execute("DELETE FROM bindings WHERE client_key = %s;", (client_key,))
-        return cur.rowcount > 0
-
-
-def load_bindings_into_state(state: Dict[str, Any]) -> None:
-    state["client_map"] = {}
-    state["folder_index"] = {}
-
-    with db.cursor() as cur:
-        cur.execute("SELECT client_key, folder_id, folder_name, chat_id, thread_id FROM bindings;")
-        rows = cur.fetchall()
-
-    for client_key, folder_id, folder_name, chat_id, thread_id in rows:
-        # Case-insensitive folder index for /register matching
-        state["folder_index"][client_key] = {"id": folder_id, "name": folder_name}
-
-        # Routing map for Drive notifications
-        state["client_map"][folder_id] = {
-            "chat_id": int(chat_id),
-            "thread_id": int(thread_id),
-            "team_name": folder_name,
-            "client_key": client_key,
-        }
-
-    state["folder_index_loaded"] = True
-
-
-def was_file_notified(file_id: str) -> bool:
-    with db.cursor() as cur:
-        cur.execute("SELECT 1 FROM notified_files WHERE file_id=%s;", (file_id,))
-        return cur.fetchone() is not None
-
-
-def mark_file_notified(file_id: str) -> None:
-    with db.cursor() as cur:
-        cur.execute(
-            """
-        INSERT INTO notified_files (file_id) VALUES (%s)
-        ON CONFLICT (file_id) DO NOTHING;
-        """,
-            (file_id,),
-        )
-
-
 # ---------------- GOOGLE DRIVE CLIENT ----------------
-# Needed for AUTO-CREATE folder:
 SCOPES = ["https://www.googleapis.com/auth/drive"]
 FOLDER_MIME = "application/vnd.google-apps.folder"
 
@@ -176,17 +100,170 @@ STATE: Dict[str, Any] = {
     "channel_id": None,
     "resource_id": None,
     "expiration_ms": None,  # epoch ms from Google
-    # folder_id -> destination
-    "client_map": {},
-    # canonical client key -> {"id": folder_id, "name": folder_name}
-    "folder_index": {},
-    "folder_index_loaded": False,
+
+    # customs_root_folder_id -> {chat_id, thread_id, client_name, ...}
+    "customs_map": {},
+
+    # client_key -> binding details (for /list)
+    "bindings_by_client": {},
+
+    # caches (for ancestor checks & pretty paths)
+    "parents_cache": {},  # file_id -> [parent_ids]
+    "name_cache": {},     # file_id -> name
+    "route_cache": {},    # folder_id -> (customs_root_id or None)
 }
 
-# Background renew task handle
 RENEW_TASK: Optional[asyncio.Task] = None
 
-# ---------------- HELPERS: TELEGRAM ----------------
+
+# ---------------- TEXT NORMALIZATION ----------------
+def canonical_name(name: str) -> str:
+    """
+    Emoji/symbol-safe normalization for matching.
+    - lowercases
+    - removes emojis/special chars
+    - keeps letters/numbers
+    - collapses whitespace
+    Examples:
+      "OnlyFans ✅" -> "onlyfans"
+      "✅ OnlyFans" -> "onlyfans"
+      "Ally   Lotti" -> "ally lotti"
+    """
+    name = (name or "").strip().lower()
+    name = re.sub(r"[^a-z0-9]+", " ", name)  # remove emojis/symbols
+    name = re.sub(r"\s+", " ", name).strip()
+    return name
+
+
+def normalize_spaces(name: str) -> str:
+    name = (name or "").strip()
+    name = re.sub(r"\s+", " ", name)
+    return name
+
+
+# ---------------- DB INIT ----------------
+def init_db() -> None:
+    with db.cursor() as cur:
+        # Bindings: connect existing folders only (no Drive create/delete)
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS bindings (
+                client_key TEXT PRIMARY KEY,
+                client_name TEXT NOT NULL,
+
+                client_folder_id TEXT NOT NULL,
+                onlyfans_folder_id TEXT NOT NULL,
+                customs_folder_id TEXT NOT NULL,
+
+                chat_id BIGINT NOT NULL,
+                thread_id BIGINT NOT NULL,
+
+                created_at TIMESTAMPTZ DEFAULT NOW(),
+                updated_at TIMESTAMPTZ DEFAULT NOW()
+            );
+            """
+        )
+
+        # Dedupe by file_id forever
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS notified_files (
+                file_id TEXT PRIMARY KEY,
+                notified_at TIMESTAMPTZ DEFAULT NOW()
+            );
+            """
+        )
+
+
+def save_binding(
+    client_key: str,
+    client_name: str,
+    client_folder_id: str,
+    onlyfans_folder_id: str,
+    customs_folder_id: str,
+    chat_id: int,
+    thread_id: int,
+) -> None:
+    with db.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO bindings (
+                client_key, client_name,
+                client_folder_id, onlyfans_folder_id, customs_folder_id,
+                chat_id, thread_id, updated_at
+            )
+            VALUES (%s,%s,%s,%s,%s,%s,%s,NOW())
+            ON CONFLICT (client_key) DO UPDATE SET
+                client_name = EXCLUDED.client_name,
+                client_folder_id = EXCLUDED.client_folder_id,
+                onlyfans_folder_id = EXCLUDED.onlyfans_folder_id,
+                customs_folder_id = EXCLUDED.customs_folder_id,
+                chat_id = EXCLUDED.chat_id,
+                thread_id = EXCLUDED.thread_id,
+                updated_at = NOW();
+            """,
+            (client_key, client_name, client_folder_id, onlyfans_folder_id, customs_folder_id, chat_id, thread_id),
+        )
+
+
+def delete_binding(client_key: str) -> bool:
+    # NOTE: DB only. Does NOT touch Drive.
+    with db.cursor() as cur:
+        cur.execute("DELETE FROM bindings WHERE client_key=%s;", (client_key,))
+        return cur.rowcount > 0
+
+
+def load_bindings_into_state() -> None:
+    STATE["customs_map"] = {}
+    STATE["bindings_by_client"] = {}
+    STATE["route_cache"] = {}  # reset route cache
+
+    with db.cursor() as cur:
+        cur.execute(
+            """
+            SELECT client_key, client_name, client_folder_id, onlyfans_folder_id, customs_folder_id, chat_id, thread_id
+            FROM bindings;
+            """
+        )
+        rows = cur.fetchall()
+
+    for (client_key, client_name, client_folder_id, onlyfans_folder_id, customs_folder_id, chat_id, thread_id) in rows:
+        STATE["bindings_by_client"][client_key] = {
+            "client_key": client_key,
+            "client_name": client_name,
+            "client_folder_id": client_folder_id,
+            "onlyfans_folder_id": onlyfans_folder_id,
+            "customs_folder_id": customs_folder_id,
+            "chat_id": int(chat_id),
+            "thread_id": int(thread_id),
+        }
+        STATE["customs_map"][customs_folder_id] = {
+            "chat_id": int(chat_id),
+            "thread_id": int(thread_id),
+            "client_key": client_key,
+            "client_name": client_name,
+            "customs_folder_id": customs_folder_id,
+        }
+
+
+def was_file_notified(file_id: str) -> bool:
+    with db.cursor() as cur:
+        cur.execute("SELECT 1 FROM notified_files WHERE file_id=%s;", (file_id,))
+        return cur.fetchone() is not None
+
+
+def mark_file_notified(file_id: str) -> None:
+    with db.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO notified_files (file_id) VALUES (%s)
+            ON CONFLICT (file_id) DO NOTHING;
+            """,
+            (file_id,),
+        )
+
+
+# ---------------- TELEGRAM HELPERS ----------------
 async def tg_call(method: str, payload: dict) -> dict:
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/{method}"
     async with httpx.AsyncClient(timeout=20) as client:
@@ -208,106 +285,189 @@ async def ensure_telegram_webhook() -> None:
     await tg_call("setWebhook", {"url": hook_url})
 
 
-# ---------------- HELPERS: DRIVE FOLDER NAMING ----------------
-def canonical_name(name: str) -> str:
-    # "  Miss   Lexa  " -> "miss lexa"
-    name = name.strip()
-    name = re.sub(r"\s+", " ", name)
-    return name.lower()
-
-
-def display_name(name: str) -> str:
-    # Keeps user casing; normalizes spaces.
-    name = name.strip()
-    name = re.sub(r"\s+", " ", name)
-    return name
-
-
-def list_completed_folders() -> List[Dict[str, str]]:
-    folders: List[Dict[str, str]] = []
+# ---------------- DRIVE LISTING (NO CREATE/DELETE) ----------------
+def drive_files_list(q: str, page_size: int = 1000) -> List[Dict[str, str]]:
+    out: List[Dict[str, str]] = []
     page_token = None
-    q = (
-        f"'{COMPLETED_FOLDER_ID}' in parents "
-        f"and mimeType = '{FOLDER_MIME}' "
-        f"and trashed = false"
-    )
     while True:
         res = drive.files().list(
             q=q,
-            pageSize=1000,
-            fields="nextPageToken, files(id,name)",
+            pageSize=page_size,
+            fields="nextPageToken, files(id,name,mimeType)",
             pageToken=page_token,
+            includeItemsFromAllDrives=True,
+            supportsAllDrives=True,
         ).execute()
-        folders.extend(res.get("files", []))
+        out.extend(res.get("files", []))
         page_token = res.get("nextPageToken")
         if not page_token:
             break
-    return folders
+    return out
 
 
-def refresh_folder_index_from_drive() -> None:
+def drive_list_child_folders(parent_id: str) -> List[Dict[str, str]]:
+    q = (
+        f"'{parent_id}' in parents "
+        f"and mimeType = '{FOLDER_MIME}' "
+        f"and trashed = false"
+    )
+    files = drive_files_list(q=q)
+    return [{"id": f["id"], "name": f.get("name", "")} for f in files]
+
+
+def drive_find_client_folder_exact_under_root(client_name: str) -> Optional[Dict[str, str]]:
     """
-    Adds any missing folders found in Drive to the in-memory folder index.
-    Does NOT overwrite DB bindings; it only fills gaps.
+    Finds <Client Name> folder ONLY under CLIENTS_ROOT_ID.
+    Must match EXACT (after canonical_name normalization).
+    This ensures we never accidentally pick an OnlyFans elsewhere.
     """
-    idx: Dict[str, Dict[str, str]] = {}
-    for f in list_completed_folders():
-        key = canonical_name(f.get("name", ""))
-        if not key:
-            continue
-        if key not in idx:
-            idx[key] = {"id": f["id"], "name": f.get("name", "")}
+    target = canonical_name(client_name)
+    if not target:
+        return None
 
-    for k, v in idx.items():
-        if k not in STATE["folder_index"]:
-            STATE["folder_index"][k] = v
-
-    STATE["folder_index_loaded"] = True
+    for f in drive_list_child_folders(CLIENTS_ROOT_ID):
+        if canonical_name(f.get("name", "")) == target:
+            return {"id": f["id"], "name": f.get("name", "")}
+    return None
 
 
-def create_client_folder(folder_name: str) -> Dict[str, str]:
-    metadata = {
-        "name": folder_name,
-        "mimeType": FOLDER_MIME,
-        "parents": [COMPLETED_FOLDER_ID],
-    }
-    created = drive.files().create(body=metadata, fields="id,name").execute()
-    return {"id": created["id"], "name": created.get("name", folder_name)}
-
-
-def find_or_create_client_folder(client_input: str) -> Tuple[str, str, bool]:
+def drive_find_child_folder_contains(parent_id: str, token: str) -> Optional[Dict[str, str]]:
     """
-    Returns: (folder_id, actual_folder_name, created_bool)
-    Case-insensitive; supports multi-word names.
-    Uses DB-loaded folder_index first; then Drive refresh; then creates.
+    Finds a child folder under a SPECIFIC parent whose canonical name CONTAINS token.
+    Example token="onlyfans" matches:
+      "OnlyFans ✅", "✅ OnlyFans", "OnlyFans (Main)", etc.
     """
-    key = canonical_name(client_input)
-    if not key:
-        raise ValueError("Empty client name")
+    t = canonical_name(token)
+    if not t:
+        return None
 
-    if not STATE["folder_index_loaded"]:
-        refresh_folder_index_from_drive()
-
-    existing = STATE["folder_index"].get(key)
-    if existing:
-        return existing["id"], existing["name"], False
-
-    # Refresh from Drive before creating (prevents duplicates if created manually)
-    refresh_folder_index_from_drive()
-    existing2 = STATE["folder_index"].get(key)
-    if existing2:
-        return existing2["id"], existing2["name"], False
-
-    nice = display_name(client_input)
-    created = create_client_folder(nice)
-
-    STATE["folder_index"][key] = {"id": created["id"], "name": created["name"]}
-    return created["id"], created["name"], True
+    for f in drive_list_child_folders(parent_id):
+        n = canonical_name(f.get("name", ""))
+        if t in n:
+            return {"id": f["id"], "name": f.get("name", "")}
+    return None
 
 
-# ---------------- HELPERS: DRIVE WATCH & CHANGES ----------------
+def find_client_onlyfans_customs(client_input: str) -> Tuple[str, str, str, str, str]:
+    """
+    Returns:
+      (client_folder_id, client_folder_name, onlyfans_folder_id, customs_folder_id, customs_folder_name)
+
+    Guarantees:
+    - OnlyFans is searched ONLY inside the matched client folder under CLIENTS_ROOT_ID.
+    - Customs is searched ONLY inside that OnlyFans folder.
+    - NO create / NO delete in Drive.
+    """
+    client = drive_find_client_folder_exact_under_root(client_input)
+    if not client:
+        raise ValueError(f"Client folder does not exist under root: {client_input}")
+
+    onlyfans = drive_find_child_folder_contains(client["id"], ONLYFANS_TOKEN)
+    if not onlyfans:
+        raise ValueError(f"OnlyFans folder does not exist inside client: {client['name']}")
+
+    customs = drive_find_child_folder_contains(onlyfans["id"], CUSTOMS_TOKEN)
+    if not customs:
+        raise ValueError(f"Customs folder does not exist inside: {client['name']} / {onlyfans['name']}")
+
+    return client["id"], client["name"], onlyfans["id"], customs["id"], customs["name"]
+
+
+def drive_get_file_min(file_id: str) -> Dict[str, Any]:
+    res = drive.files().get(
+        fileId=file_id,
+        fields="id,name,mimeType,parents,webViewLink",
+        supportsAllDrives=True,
+    ).execute()
+    STATE["name_cache"][file_id] = res.get("name")
+    STATE["parents_cache"][file_id] = res.get("parents") or []
+    return res
+
+
+def get_parents_cached(file_id: str) -> List[str]:
+    if file_id in STATE["parents_cache"]:
+        return STATE["parents_cache"][file_id] or []
+    try:
+        meta = drive_get_file_min(file_id)
+        return meta.get("parents") or []
+    except Exception:
+        STATE["parents_cache"][file_id] = []
+        return []
+
+
+def get_name_cached(file_id: str) -> str:
+    if file_id in STATE["name_cache"] and STATE["name_cache"][file_id]:
+        return STATE["name_cache"][file_id]
+    try:
+        meta = drive_get_file_min(file_id)
+        return meta.get("name") or "(no name)"
+    except Exception:
+        return "(no name)"
+
+
+def make_drive_link(file_id: str, mime_type: Optional[str]) -> str:
+    if mime_type == FOLDER_MIME:
+        return f"https://drive.google.com/drive/folders/{file_id}"
+    return f"https://drive.google.com/file/d/{file_id}/view"
+
+
+def find_registered_customs_root(start_parent_id: str) -> Optional[str]:
+    """
+    Walk up ancestors from a folder and see if it's under a registered Customs root.
+    Returns customs_root_id if found.
+    """
+    if start_parent_id in STATE["route_cache"]:
+        return STATE["route_cache"][start_parent_id]
+
+    visited = set()
+    cur = start_parent_id
+
+    while cur and cur not in visited:
+        visited.add(cur)
+
+        if cur in STATE["customs_map"]:
+            for v in visited:
+                STATE["route_cache"][v] = cur
+            return cur
+
+        parents = get_parents_cached(cur)
+        if not parents:
+            break
+        cur = parents[0]
+
+    for v in visited:
+        STATE["route_cache"][v] = None
+    return None
+
+
+def build_path_from_customs(customs_root_id: str, item_parent_id: str, item_name: str, client_name: str) -> str:
+    """
+    Client / OnlyFans / Customs / ... / item
+    We don't assume the exact OnlyFans name; we show the real names from Drive cache.
+    """
+    parts = []
+    cur = item_parent_id
+    visited = set()
+
+    while cur and cur != customs_root_id and cur not in visited:
+        visited.add(cur)
+        parts.append(get_name_cached(cur))
+        parents = get_parents_cached(cur)
+        cur = parents[0] if parents else None
+
+    customs_name = get_name_cached(customs_root_id)
+    parts = list(reversed(parts))
+
+    if parts:
+        return f"{client_name} / {customs_name} / " + " / ".join(parts) + f" / {item_name}"
+    return f"{client_name} / {customs_name} / {item_name}"
+
+
+# ---------------- DRIVE WATCH & CHANGES ----------------
 def get_start_page_token() -> str:
-    res = drive.changes().getStartPageToken().execute()
+    res = drive.changes().getStartPageToken(
+        supportsAllDrives=True
+    ).execute()
     return res["startPageToken"]
 
 
@@ -316,7 +476,9 @@ def list_changes(page_token: str) -> Tuple[List[dict], str]:
         pageToken=page_token,
         spaces="drive",
         includeRemoved=False,
-        fields="newStartPageToken,nextPageToken,changes(fileId,file(name,mimeType,parents,webViewLink),removed)",
+        fields="newStartPageToken,nextPageToken,changes(fileId,file(id,name,mimeType,parents,webViewLink),removed)",
+        includeItemsFromAllDrives=True,
+        supportsAllDrives=True,
     ).execute()
     changes = res.get("changes", [])
     new_token = res.get("newStartPageToken") or res.get("nextPageToken") or page_token
@@ -331,7 +493,11 @@ def start_watch() -> Dict[str, Any]:
     webhook_url = f"{BASE_URL}/drive/webhook?secret={WATCH_SECRET}"
 
     body = {"id": channel_id, "type": "web_hook", "address": webhook_url}
-    res = drive.changes().watch(pageToken=STATE["page_token"], body=body).execute()
+    res = drive.changes().watch(
+        pageToken=STATE["page_token"],
+        body=body,
+        supportsAllDrives=True,
+    ).execute()
 
     STATE["channel_id"] = channel_id
     STATE["resource_id"] = res.get("resourceId")
@@ -340,50 +506,33 @@ def start_watch() -> Dict[str, Any]:
 
 
 def renew_watch_now() -> Dict[str, Any]:
-    """
-    Renews the Drive watch and returns raw watch response.
-    Safe to call multiple times.
-    """
     return start_watch()
 
 
 # ---------------- AUTO-RENEW LOOP ----------------
 async def watch_renewer_loop():
-    """
-    Background loop:
-    - checks expiration_ms
-    - renews if missing or expiring soon
-    """
-    # How early to renew before expiry
     RENEW_AHEAD_SECONDS = 6 * 60 * 60  # 6 hours
-    # Minimum sleep between checks
-    MIN_CHECK_SECONDS = 15 * 60  # 15 minutes
-    # Max sleep between checks
-    MAX_CHECK_SECONDS = 6 * 60 * 60  # 6 hours
+    MIN_CHECK_SECONDS = 15 * 60        # 15 minutes
+    MAX_CHECK_SECONDS = 6 * 60 * 60    # 6 hours
 
     while True:
         try:
             exp_ms = STATE.get("expiration_ms")
             now_s = int(time.time())
 
-            # If no expiration known, renew soon
             if not exp_ms:
                 renew_watch_now()
-                # after renewing, re-evaluate on next loop
                 await asyncio.sleep(MIN_CHECK_SECONDS)
                 continue
 
             exp_s = int(exp_ms / 1000)
             seconds_left = exp_s - now_s
 
-            # Renew if expiring soon (or already expired)
             if seconds_left <= RENEW_AHEAD_SECONDS:
                 renew_watch_now()
                 await asyncio.sleep(MIN_CHECK_SECONDS)
                 continue
 
-            # Sleep until it's time to renew, but bounded
-            # wake up earlier in case of restarts/clock drift
             sleep_s = max(MIN_CHECK_SECONDS, seconds_left - RENEW_AHEAD_SECONDS)
             sleep_s = min(sleep_s, MAX_CHECK_SECONDS)
             await asyncio.sleep(sleep_s)
@@ -391,7 +540,6 @@ async def watch_renewer_loop():
         except asyncio.CancelledError:
             raise
         except Exception:
-            # If anything unexpected happens, wait a bit and try again
             await asyncio.sleep(MIN_CHECK_SECONDS)
 
 
@@ -399,18 +547,12 @@ async def watch_renewer_loop():
 @app.on_event("startup")
 async def on_startup():
     global RENEW_TASK
-
     init_db()
-    load_bindings_into_state(STATE)  # ✅ restores /register bindings after deploys
-    refresh_folder_index_from_drive()
+    load_bindings_into_state()
 
-    # Start Telegram webhook
     await ensure_telegram_webhook()
-
-    # Start (or renew) Drive watch immediately on boot
     renew_watch_now()
 
-    # Start auto-renew background task (no cron needed)
     if RENEW_TASK is None or RENEW_TASK.done():
         RENEW_TASK = asyncio.create_task(watch_renewer_loop())
 
@@ -435,7 +577,7 @@ async def telegram_webhook(secret: str, request: Request):
 
     update = await request.json()
 
-    # ✅ Do NOT auto-send welcome messages (prevents spam in General)
+    # avoid spam join events
     if "my_chat_member" in update:
         return {"ok": True}
 
@@ -450,7 +592,7 @@ async def telegram_webhook(secret: str, request: Request):
     chat = msg["chat"]
     chat_id = chat["id"]
     chat_type = chat.get("type")
-    thread_id = msg.get("message_thread_id")  # present only when inside a Topic
+    thread_id = msg.get("message_thread_id")  # Topics only
 
     sender = msg.get("from") or {}
     user_id = sender.get("id")
@@ -469,82 +611,66 @@ async def telegram_webhook(secret: str, request: Request):
             await tg_send(chat_id, "Use /register inside a Telegram group.")
             return {"ok": True}
 
-        # Must be inside a Topic (so we bind to that topic only)
         if thread_id is None:
-            await tg_send(chat_id, "⚠️ Please run /register inside the Topic where you want updates.")
-            return {"ok": True}
-
-        parts = text.split(maxsplit=1)
-
-        # If they typed just "/register" with no name, show help INSIDE the TOPIC
-        if len(parts) < 2 or not parts[1].strip():
-            await tg_send(
-                chat_id,
-                "👋 Customs Notify Bot here.\n\n"
-                "✅ Register THIS Topic to a client folder:\n"
-                "/register <client name>\n\n"
-                "Examples:\n"
-                "/register autumn\n"
-                "/register Autumn\n"
-                "/register miss lexa\n\n"
-                "I’ll auto-create the folder under Completed (if missing) and post updates ONLY in this Topic.",
-                thread_id=thread_id,
-            )
+            await tg_send(chat_id, "⚠️ Run /register inside the Topic where you want updates.")
             return {"ok": True}
 
         if not await is_admin():
             await tg_send(chat_id, "Only admins can run /register.", thread_id=thread_id)
             return {"ok": True}
 
-        client_input = parts[1].strip()
-        key = canonical_name(client_input)
-
-        try:
-            folder_id, folder_name, created = find_or_create_client_folder(client_input)
-        except Exception as e:
+        parts = text.split(maxsplit=1)
+        if len(parts) < 2 or not parts[1].strip():
             await tg_send(
                 chat_id,
-                "❌ I couldn’t create/find that Drive folder.\n"
-                "Make sure the service account has *Editor* access to the Completed folder.\n"
-                f"Error: {str(e)[:200]}",
+                "✅ Connect THIS Topic to an existing client's Customs folder:\n"
+                "/register <client name>\n\n"
+                "Example:\n"
+                "/register ally lotti\n\n"
+                "This bot will NOT create or delete anything in Drive.\n"
+                "It only connects to:\n"
+                "<Client> / OnlyFans / Customs",
                 thread_id=thread_id,
             )
             return {"ok": True}
 
-        # Bind: folder -> this group/topic
-        STATE["client_map"][folder_id] = {
-            "chat_id": int(chat_id),
-            "thread_id": int(thread_id),
-            "team_name": folder_name,
-            "client_key": key,
-        }
-        STATE["folder_index"][key] = {"id": folder_id, "name": folder_name}
-        STATE["folder_index_loaded"] = True
+        client_input = normalize_spaces(parts[1])
+        client_key = canonical_name(client_input)
 
-        # ✅ Persist (survives redeploys)
+        try:
+            client_folder_id, client_folder_name, onlyfans_id, customs_id, customs_name = find_client_onlyfans_customs(client_input)
+        except Exception:
+            await tg_send(
+                chat_id,
+                "❌ Folder does not exist.\n\n"
+                "Expected path (inside your Clients root):\n"
+                f"{client_input} / (OnlyFans...) / (Customs...)\n\n"
+                "✅ Note: OnlyFans can be like 'OnlyFans ✅' and still works.\n"
+                "Please check the folder spelling under the Clients root.",
+                thread_id=thread_id,
+            )
+            return {"ok": True}
+
+        # Save binding (DB only)
         save_binding(
-            client_key=key,
-            folder_id=folder_id,
-            folder_name=folder_name,
+            client_key=client_key,
+            client_name=client_folder_name,
+            client_folder_id=client_folder_id,
+            onlyfans_folder_id=onlyfans_id,
+            customs_folder_id=customs_id,
             chat_id=int(chat_id),
             thread_id=int(thread_id),
         )
+        load_bindings_into_state()
 
-        if created:
-            reply = (
-                "✅ Registered & created!\n"
-                f"📁 Drive folder: Completed/{folder_name}\n"
-                "🧷 Updates will post ONLY in this Topic."
-            )
-        else:
-            reply = (
-                "✅ Registered!\n"
-                f"📁 Folder already exists: Completed/{folder_name}\n"
-                "🧷 Updates will post ONLY in this Topic.\n"
-                "(No duplicate folder created.)"
-            )
-
-        await tg_send(chat_id, reply, thread_id=thread_id)
+        await tg_send(
+            chat_id,
+            "✅ Connected successfully!\n"
+            f"📁 Connected to: {client_folder_name}\n"
+            f"🔗 Watching: {client_folder_name} / {get_name_cached(onlyfans_id) if onlyfans_id else 'OnlyFans'} / {customs_name}\n"
+            "📌 Notifications will be sent in this topic.",
+            thread_id=thread_id,
+        )
         return {"ok": True}
 
     # ---------- /unregister ----------
@@ -561,18 +687,16 @@ async def telegram_webhook(secret: str, request: Request):
 
         parts = text.split(maxsplit=1)
         if len(parts) < 2 or not parts[1].strip():
-            await tg_send(chat_id, "Usage: /unregister <client name>\nExample: /unregister autumn", thread_id=thread_id)
+            await tg_send(chat_id, "Usage: /unregister <client name>\nExample: /unregister ally lotti", thread_id=thread_id)
             return {"ok": True}
 
         key = canonical_name(parts[1].strip())
         existed = delete_binding(key)
-
-        load_bindings_into_state(STATE)
-        refresh_folder_index_from_drive()
+        load_bindings_into_state()
 
         await tg_send(
             chat_id,
-            "🗑️ Unregistered (deleted binding)." if existed else "Nothing to delete for that name.",
+            "🗑️ Unregistered (DB binding removed only)." if existed else "Nothing to delete for that name.",
             thread_id=thread_id,
         )
         return {"ok": True}
@@ -580,20 +704,11 @@ async def telegram_webhook(secret: str, request: Request):
     # ---------- /list ----------
     if text.lower().startswith("/list"):
         lines = []
-        for fid, dest in STATE["client_map"].items():
+        for k, b in STATE["bindings_by_client"].items():
             lines.append(
-                f"- {dest.get('team_name')} | folder_id={fid} | chat_id={dest.get('chat_id')} | thread_id={dest.get('thread_id')}"
+                f"- {b['client_name']} | key={k} | customs_folder_id={b['customs_folder_id']} | chat_id={b['chat_id']} | thread_id={b['thread_id']}"
             )
         await tg_send(chat_id, "📌 Current bindings:\n" + ("\n".join(lines) if lines else "(none yet)"), thread_id=thread_id)
-        return {"ok": True}
-
-    # ---------- /refreshfolders ----------
-    if text.lower().startswith("/refreshfolders"):
-        if not await is_admin():
-            await tg_send(chat_id, "Only admins can run /refreshfolders.", thread_id=thread_id)
-            return {"ok": True}
-        refresh_folder_index_from_drive()
-        await tg_send(chat_id, f"✅ Refreshed folder index. Known folders: {len(STATE['folder_index'])}.", thread_id=thread_id)
         return {"ok": True}
 
     return {"ok": True}
@@ -610,11 +725,11 @@ async def drive_webhook(request: Request):
     resource_id = request.headers.get("X-Goog-Resource-Id")
     resource_state = request.headers.get("X-Goog-Resource-State")
 
-    # Validate watch channel
+    # Validate watch
     if channel_id != STATE["channel_id"] or resource_id != STATE["resource_id"]:
         return Response(status_code=200)
 
-    # Initial sync event
+    # Initial sync ping
     if resource_state == "sync":
         return Response(status_code=200)
 
@@ -632,57 +747,76 @@ async def drive_webhook(request: Request):
         if ch.get("removed"):
             continue
 
-        f = ch.get("file")
-        if not f:
-            continue
-
+        f = ch.get("file") or {}
         file_id = ch.get("fileId") or f.get("id")
         if not file_id:
             continue
 
-        # ✅ DEDUPE (by file_id forever)
+        # dedupe
         if was_file_notified(file_id):
             continue
 
-        file_name = f.get("name", "(no name)")
+        file_name = f.get("name") or "(no name)"
+        mime_type = f.get("mimeType")
         parents = f.get("parents") or []
-        link = f.get("webViewLink") or f"https://drive.google.com/file/d/{file_id}/view"
 
-        # Notify if direct parent folder is registered
-        dest = None
+        # cache basic meta
+        STATE["name_cache"][file_id] = file_name
+        STATE["parents_cache"][file_id] = parents
+
+        if not parents:
+            continue
+
+        # Check if item is inside ANY registered customs folder (including subfolders)
+        customs_root_id = None
         for p in parents:
-            if p in STATE["client_map"]:
-                dest = STATE["client_map"][p]
+            customs_root_id = find_registered_customs_root(p)
+            if customs_root_id:
                 break
 
+        if not customs_root_id:
+            continue
+
+        dest = STATE["customs_map"].get(customs_root_id)
         if not dest:
             continue
 
-        text = (
-            f"✅ Custom delivered: {dest.get('team_name')}\n"
-            f"📁 {file_name}\n"
-            f"🔗 {link}"
+        client_name = dest.get("client_name") or "Client"
+        full_path = build_path_from_customs(
+            customs_root_id=customs_root_id,
+            item_parent_id=parents[0],
+            item_name=file_name,
+            client_name=client_name,
         )
+
+        link = f.get("webViewLink") or make_drive_link(file_id, mime_type)
+
+        if mime_type == FOLDER_MIME:
+            text = (
+                "📂 New folder created\n"
+                f"🧾 {full_path}\n"
+                f"🔗 {link}"
+            )
+        else:
+            text = (
+                "✅ New upload\n"
+                f"🧾 {full_path}\n"
+                f"🔗 {link}"
+            )
 
         try:
             await tg_send(dest["chat_id"], text, thread_id=dest.get("thread_id"))
-            mark_file_notified(file_id)  # ✅ mark only after successful send
+            mark_file_notified(file_id)
             notified += 1
         except Exception:
-            # Don't mark as notified if Telegram failed (so it can retry later)
             continue
 
     return {"ok": True, "changes": len(changes), "notified": notified}
 
 
-# ---------------- WATCH RENEW (manual, optional) ----------------
+# ---------------- WATCH RENEW (optional manual) ----------------
 @app.post("/watch/renew")
 def renew_watch(secret: str):
-    """
-    Optional manual call:
-    POST /watch/renew?secret=WATCH_SECRET
-    Auto-renew already runs in the background.
-    """
     if secret != WATCH_SECRET:
         raise HTTPException(status_code=403, detail="forbidden")
     res = renew_watch_now()
@@ -703,7 +837,7 @@ def health():
         "watch_channel_id": STATE["channel_id"],
         "watch_resource_id": STATE["resource_id"],
         "watch_expiration_ms": STATE["expiration_ms"],
-        "client_map_size": len(STATE["client_map"]),
-        "folder_index_size": len(STATE["folder_index"]),
+        "bindings_count": len(STATE["bindings_by_client"]),
         "auto_renew_running": bool(RENEW_TASK and not RENEW_TASK.done()),
+        "note": "This bot never creates/deletes anything in Drive.",
     }
